@@ -11,6 +11,12 @@ variable "config_json" {
   sensitive   = true
 }
 
+variable "use_secrets_manager" {
+  description = "ECS only. Deliver config.json via a Secrets Manager secret (secure, recommended). When false, config_json is injected as a plaintext environment variable in the task definition instead — no Secrets Manager resource is created. Simpler for learning/sandbox use, not recommended for real deployments since the config (including API keys) ends up in plaintext in the task definition and Terraform state."
+  type        = bool
+  default     = true
+}
+
 # --- Image ---
 variable "image" {
   description = "Full Docker image reference (repository:tag)."
@@ -87,8 +93,14 @@ variable "existing_security_group_ids" {
 
 # --- Optional features ---
 variable "create_load_balancer" {
-  description = "Create an Application Load Balancer."
+  description = "Create a dedicated Application Load Balancer. Ignored (ECS) when existing_target_group_arn is set."
   type        = bool
+}
+
+variable "existing_target_group_arn" {
+  description = "ARN of an existing (e.g. shared) ALB target group to register the ECS service with. ECS only. When set, no dedicated ALB is created."
+  type        = string
+  default     = null
 }
 
 variable "assign_public_ip" {

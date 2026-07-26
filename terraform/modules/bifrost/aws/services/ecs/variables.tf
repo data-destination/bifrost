@@ -68,9 +68,23 @@ variable "execution_role_arn" {
   type        = string
 }
 
+variable "use_secrets_manager" {
+  description = "Deliver config.json via a Secrets Manager secret (secure, recommended for real deployments). When false, config_json is injected as a plaintext environment variable baked into the task definition (simpler, no Secrets Manager cost/dependency, but the config — including any API keys — is stored in plaintext in the task definition and Terraform state)."
+  type        = bool
+  default     = true
+}
+
 variable "secret_arn" {
-  description = "ARN of the Secrets Manager secret containing config.json."
+  description = "ARN of the Secrets Manager secret containing config.json. Required when use_secrets_manager = true."
   type        = string
+  default     = null
+}
+
+variable "config_json" {
+  description = "Complete Bifrost config.json as a string. Required when use_secrets_manager = false (injected as a plaintext environment variable)."
+  type        = string
+  default     = null
+  sensitive   = true
 }
 
 variable "log_group_name" {
@@ -86,8 +100,14 @@ variable "create_cluster" {
 
 # --- Features ---
 variable "create_load_balancer" {
-  description = "Create an Application Load Balancer."
+  description = "Create a dedicated Application Load Balancer. Ignored when existing_target_group_arn is set."
   type        = bool
+}
+
+variable "existing_target_group_arn" {
+  description = "ARN of an existing (e.g. shared) ALB target group to register the ECS service with. When set, no dedicated ALB/target group/listener is created — the service attaches to this target group instead."
+  type        = string
+  default     = null
 }
 
 variable "enable_autoscaling" {

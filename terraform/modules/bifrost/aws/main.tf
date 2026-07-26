@@ -26,6 +26,7 @@ locals {
   create_vpc             = var.existing_vpc_id == null
   create_subnets         = var.existing_subnet_ids == null
   create_security_groups = var.existing_security_group_ids == null
+  create_secret          = local.is_ecs && var.use_secrets_manager
 
   vpc_id             = local.create_vpc ? aws_vpc.this[0].id : var.existing_vpc_id
   subnet_ids         = local.create_subnets ? aws_subnet.public[*].id : var.existing_subnet_ids
@@ -136,12 +137,15 @@ resource "aws_vpc_security_group_egress_rule" "all_outbound" {
 }
 
 # =============================================================================
-# Secrets Manager — stores Bifrost config.json (ECS only)
-# EKS uses Kubernetes secrets directly and does not need Secrets Manager.
+# Secrets Manager — stores Bifrost config.json (ECS only, when
+# use_secrets_manager = true). EKS uses Kubernetes secrets directly.
+# When use_secrets_manager = false, config.json is injected as a plaintext
+# environment variable in the task definition instead (see services/ecs) —
+# no secret is created and no Secrets Manager cost is incurred.
 # =============================================================================
 
 resource "aws_secretsmanager_secret" "bifrost_config" {
-  count = local.is_ecs ? 1 : 0
+  count = local.create_secret ? 1 : 0
 
   name                    = "${var.name_prefix}/config"
   description             = "Bifrost configuration (config.json)"
@@ -153,7 +157,7 @@ resource "aws_secretsmanager_secret" "bifrost_config" {
 }
 
 resource "aws_secretsmanager_secret_version" "bifrost_config" {
-  count = local.is_ecs ? 1 : 0
+  count = local.create_secret ? 1 : 0
 
   secret_id     = aws_secretsmanager_secret.bifrost_config[0].id
   secret_string = var.config_json
@@ -166,7 +170,7 @@ resource "aws_secretsmanager_secret_version" "bifrost_config" {
 resource "aws_iam_role" "ecs_execution" {
   count = local.is_ecs ? 1 : 0
 
-  name               = "${var.name_prefix}-ecs-execution"
+  name = "${var.name_prefix}-ecs-execution"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -193,24 +197,28 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_policy" {
 resource "aws_iam_role_policy" "bifrost_secrets" {
   count = local.is_ecs ? 1 : 0
 
-  name   = "${var.name_prefix}-secrets-access"
-  role   = aws_iam_role.ecs_execution[0].id
+  name = "${var.name_prefix}-secrets-access"
+  role = aws_iam_role.ecs_execution[0].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowGetBifrostSecret"
-        Effect = "Allow"
-        Action = ["secretsmanager:GetSecretValue"]
-        Resource = [aws_secretsmanager_secret.bifrost_config[0].arn]
-      },
-      {
-        Sid    = "AllowCloudWatchLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = ["${aws_cloudwatch_log_group.bifrost[0].arn}:*"]
-      }
-    ]
+    Statement = concat(
+      local.create_secret ? [
+        {
+          Sid      = "AllowGetBifrostSecret"
+          Effect   = "Allow"
+          Action   = ["secretsmanager:GetSecretValue"]
+          Resource = [aws_secretsmanager_secret.bifrost_config[0].arn]
+        }
+      ] : [],
+      [
+        {
+          Sid      = "AllowCloudWatchLogs"
+          Effect   = "Allow"
+          Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+          Resource = ["${aws_cloudwatch_log_group.bifrost[0].arn}:*"]
+        }
+      ]
+    )
   })
 }
 
@@ -258,13 +266,16 @@ module "ecs" {
   security_group_ids = local.security_group_ids
 
   # IAM & secrets
-  execution_role_arn = aws_iam_role.ecs_execution[0].arn
-  secret_arn         = aws_secretsmanager_secret.bifrost_config[0].arn
-  log_group_name     = aws_cloudwatch_log_group.bifrost[0].name
+  execution_role_arn  = aws_iam_role.ecs_execution[0].arn
+  use_secrets_manager = var.use_secrets_manager
+  secret_arn          = local.create_secret ? aws_secretsmanager_secret.bifrost_config[0].arn : null
+  config_json         = var.use_secrets_manager ? null : var.config_json
+  log_group_name      = aws_cloudwatch_log_group.bifrost[0].name
 
   # Features
   create_cluster               = var.create_cluster
   create_load_balancer         = var.create_load_balancer
+  existing_target_group_arn    = var.existing_target_group_arn
   assign_public_ip             = var.assign_public_ip
   enable_autoscaling           = var.enable_autoscaling
   min_capacity                 = var.min_capacity

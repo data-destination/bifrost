@@ -24,6 +24,12 @@ data "aws_caller_identity" "current" {}
 locals {
   cluster_arn  = var.create_cluster ? aws_ecs_cluster.this[0].arn : "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/${var.name_prefix}-cluster"
   cluster_name = var.create_cluster ? aws_ecs_cluster.this[0].name : "${var.name_prefix}-cluster"
+
+  # Attach to an existing (e.g. shared) target group when provided, otherwise
+  # fall back to creating a dedicated ALB when create_load_balancer = true.
+  use_existing_target_group = var.existing_target_group_arn != null
+  attach_to_load_balancer   = local.use_existing_target_group || var.create_load_balancer
+  target_group_arn          = local.use_existing_target_group ? var.existing_target_group_arn : (var.create_load_balancer ? aws_lb_target_group.bifrost[0].arn : null)
 }
 
 # --- ECS Task Definition ---
@@ -54,12 +60,19 @@ resource "aws_ecs_task_definition" "bifrost" {
         }
       ]
 
-      secrets = [
+      environment = var.use_secrets_manager ? [] : [
+        {
+          name  = "BIFROST_CONFIG"
+          value = var.config_json
+        }
+      ]
+
+      secrets = var.use_secrets_manager ? [
         {
           name      = "BIFROST_CONFIG"
           valueFrom = var.secret_arn
         }
-      ]
+      ] : []
 
       healthCheck = {
         command     = ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:${var.container_port}${var.health_check_path} || exit 1"]
@@ -101,15 +114,15 @@ resource "aws_ecs_service" "bifrost" {
   }
 
   dynamic "load_balancer" {
-    for_each = var.create_load_balancer ? [1] : []
+    for_each = local.attach_to_load_balancer ? [1] : []
     content {
-      target_group_arn = aws_lb_target_group.bifrost[0].arn
+      target_group_arn = local.target_group_arn
       container_name   = "bifrost"
       container_port   = var.container_port
     }
   }
 
-  health_check_grace_period_seconds = var.create_load_balancer ? 60 : null
+  health_check_grace_period_seconds = local.attach_to_load_balancer ? 60 : null
 
   depends_on = [
     aws_ecs_task_definition.bifrost,
@@ -121,11 +134,11 @@ resource "aws_ecs_service" "bifrost" {
 }
 
 # =============================================================================
-# Application Load Balancer (optional)
+# Application Load Balancer (optional — skipped when existing_target_group_arn is set)
 # =============================================================================
 
 resource "aws_lb" "bifrost" {
-  count = var.create_load_balancer ? 1 : 0
+  count = var.create_load_balancer && !local.use_existing_target_group ? 1 : 0
 
   name               = "${var.name_prefix}-alb"
   internal           = false
@@ -139,7 +152,7 @@ resource "aws_lb" "bifrost" {
 }
 
 resource "aws_lb_target_group" "bifrost" {
-  count = var.create_load_balancer ? 1 : 0
+  count = var.create_load_balancer && !local.use_existing_target_group ? 1 : 0
 
   name        = "${var.name_prefix}-tg"
   port        = var.container_port
@@ -165,7 +178,7 @@ resource "aws_lb_target_group" "bifrost" {
 }
 
 resource "aws_lb_listener" "http" {
-  count = var.create_load_balancer ? 1 : 0
+  count = var.create_load_balancer && !local.use_existing_target_group ? 1 : 0
 
   load_balancer_arn = aws_lb.bifrost[0].arn
   port              = 80

@@ -37,6 +37,12 @@ variable "schema_url" {
   default     = null
 }
 
+variable "use_secrets_manager" {
+  description = "AWS ECS only. Deliver config.json via a Secrets Manager secret (secure, recommended for real deployments). When false, config_json is injected as a plaintext environment variable in the task definition instead — no Secrets Manager resource is created, simpler for learning/sandbox use. Not recommended for real deployments: the config (including any API keys) ends up in plaintext in the task definition and Terraform state."
+  type        = bool
+  default     = true
+}
+
 # --- Config: individual sections (each mirrors a top-level property from config.schema.json) ---
 variable "encryption_key" {
   description = "Encryption key for sensitive data. Accepts any string; a secure 32-byte AES-256 key will be derived using Argon2id KDF."
@@ -227,9 +233,15 @@ variable "existing_security_group_ids" {
 
 # --- Optional features ---
 variable "create_load_balancer" {
-  description = "Create a load balancer. ECS: creates an ALB. EKS: creates a Kubernetes Ingress with ALB annotations (requires AWS Load Balancer Controller). GKE: creates a GCE Ingress. AKS: creates a Kubernetes Ingress."
+  description = "Create a load balancer. ECS: creates a dedicated ALB (ignored if existing_target_group_arn is set). EKS: creates a Kubernetes Ingress with ALB annotations (requires AWS Load Balancer Controller). GKE: creates a GCE Ingress. AKS: creates a Kubernetes Ingress."
   type        = bool
   default     = false
+}
+
+variable "existing_target_group_arn" {
+  description = "ARN of an existing (e.g. shared) ALB target group to register the ECS service with. AWS ECS only. When set, no dedicated ALB is created — attach a listener rule on the shared ALB to this target group yourself (see examples/aws-ecs-shared-alb)."
+  type        = string
+  default     = null
 }
 
 variable "assign_public_ip" {

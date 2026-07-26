@@ -96,6 +96,8 @@ module "aws" {
   allowed_cidr                 = var.allowed_cidr
   existing_security_group_ids  = var.existing_security_group_ids
   create_load_balancer         = var.create_load_balancer
+  existing_target_group_arn    = var.existing_target_group_arn
+  use_secrets_manager          = var.use_secrets_manager
   assign_public_ip             = var.assign_public_ip
   enable_autoscaling           = var.enable_autoscaling
   min_capacity                 = var.min_capacity

@@ -1,0 +1,62 @@
+# =============================================================================
+# Bifrost on AWS ECS (Shared ALB) — terraform.tfvars
+# WARNING: Do NOT commit this file with real secrets (API keys, passwords).
+#          Copy this to terraform.tfvars (already gitignored) and fill in.
+# =============================================================================
+
+region      = "us-east-1"
+name_prefix = "bifrost"
+
+# -----------------------------------------------------------------------------
+# Shared ALB — confirmed via AWS CLI:
+#   ALB:      datadestination-shared-alb (default VPC vpc-0a7456d9593e478a4)
+#   Listener: HTTPS/443 with ACM cert covering *.internjobs.io (ISSUED)
+#   Existing listener rule priorities in use: 100, 150, 175, 200
+# -----------------------------------------------------------------------------
+shared_alb_name        = "datadestination-shared-alb"
+bifrost_hostname       = "bifrost.internjobs.io"
+listener_rule_priority = 500
+
+image_tag = "latest"
+
+# -----------------------------------------------------------------------------
+# Auth — set an admin password. Required for the Bifrost admin UI/API.
+# -----------------------------------------------------------------------------
+auth_config = {
+  admin_username = "admin"
+  admin_password = "CHANGE_ME_STRONG_PASSWORD"
+  is_enabled     = true
+}
+
+# Optional: set to enable encryption of sensitive config fields at rest.
+# encryption_key = "CHANGE_ME"
+
+# -----------------------------------------------------------------------------
+# LLM providers — add the ones you use.
+# -----------------------------------------------------------------------------
+providers_config = {
+  openai = {
+    api_key = "sk-..."
+  }
+  anthropic = {
+    api_key = "sk-ant-..."
+  }
+}
+
+# -----------------------------------------------------------------------------
+# Compute
+# -----------------------------------------------------------------------------
+desired_count = 1
+cpu           = 512
+memory        = 1024
+
+# -----------------------------------------------------------------------------
+# Autoscaling
+# NOTE: SQLite (the default config_store/logs_store here) does not support
+# multiple concurrent nodes safely. Keep desired_count = 1 and autoscaling
+# disabled unless you switch config_store/logs_store to Postgres. See:
+# https://docs.getbifrost.ai/deployment-guides/how-to/multinode
+# -----------------------------------------------------------------------------
+enable_autoscaling = false
+min_capacity       = 1
+max_capacity       = 1
