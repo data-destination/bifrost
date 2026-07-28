@@ -117,6 +117,8 @@ playwright/.cache/
 .terraform.lock.hcl
 terraform.tfstate
 terraform.tfstate.backup
+tfplan
+*.tfplan
 *.tfvars
 !*.tfvars.example
 
