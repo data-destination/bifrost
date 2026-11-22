@@ -87,6 +87,46 @@ func (s *RDBConfigStore) ClaimSidekiqJob(ctx context.Context, id, runnerID strin
 	return res.RowsAffected == 1, nil
 }
 
+// ClaimPartitionedSidekiqJob is ClaimSidekiqJob for jobs carrying a partitioning key.
+// On top of the base claimable condition it enforces, atomically, that the job is
+// next in line for its key:
+//   - G1: no OTHER job with the same key is running under a live owner
+//     (updated_at >= staleBefore, i.e. not itself stale), and
+//   - G2: no OLDER pending job with the same key exists (FIFO by created_at, id).
+//
+// Together these give at-most-one-running plus FIFO execution per key, cluster-wide,
+// while distinct keys stay parallel. A blocked job yields RowsAffected == 0 (not
+// claimed) and is retried on the next dispatch tick. A stale (dead-owner) running
+// job does not block its key, so a crashed node cannot deadlock the queue.
+func (s *RDBConfigStore) ClaimPartitionedSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time, partitioningKey string, createdAt time.Time) (bool, error) {
+	now := time.Now()
+	res := s.DB().WithContext(ctx).
+		Model(&tables.TableSidekiqJob{}).
+		Where("id = ? AND (status = ? OR (status = ? AND updated_at < ?))",
+			id,
+			tables.SidekiqStatusPending,
+			tables.SidekiqStatusRunning, staleBefore).
+		// G1: mutual exclusion — no other same-key job running under a live owner.
+		Where("NOT EXISTS (SELECT 1 FROM sidekiq r WHERE r.partitioning_key = ? AND r.id <> ? AND r.status = ? AND r.updated_at >= ?)",
+			partitioningKey, id, tables.SidekiqStatusRunning, staleBefore).
+		// G2: FIFO — no OLDER pending job for the same key. Excludes the row itself
+		// (o.id <> id): the claim's createdAt (in-memory, nanosecond) can exceed the
+		// truncated persisted created_at, which would else block the job on itself.
+		Where("NOT EXISTS (SELECT 1 FROM sidekiq o WHERE o.partitioning_key = ? AND o.id <> ? AND o.status = ? AND (o.created_at < ? OR (o.created_at = ? AND o.id < ?)))",
+			partitioningKey, id, tables.SidekiqStatusPending, createdAt, createdAt, id).
+		Updates(map[string]any{
+			"status":     tables.SidekiqStatusRunning,
+			"runner_id":  runnerID,
+			"started_at": gorm.Expr("COALESCE(started_at, ?)", now),
+			"updated_at": now,
+			"attempts":   gorm.Expr("attempts + 1"),
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
 // HeartbeatSidekiqJob bumps the heartbeat (updated_at) for a job the caller still
 // owns and is still running. Called on a fixed interval by the owning runner so a
 // slow-but-alive job (one whose handler has not checkpointed recently) is not
@@ -180,6 +220,58 @@ func (s *RDBConfigStore) FailSidekiqJob(ctx context.Context, id, runnerID, metad
 	return nil
 }
 
+// CancelSidekiqJob flips a pending or running job to cancelled and stamps
+// completed_at. It is the durable half of a cancel request: the row immediately
+// stops looking in-flight, so it is never re-claimed by the dispatcher and never
+// reaped as stale, even if the node currently running it dies before noticing.
+//
+// It is deliberately NOT fenced on runner_id — a cancel arrives on whichever node
+// serves the HTTP request, which is often not the one that owns the job. The
+// owning node learns about it either from its in-process cancel func (same node)
+// or from its next heartbeat, which is fenced on status = running and so returns
+// "ownership lost" once the status has moved to cancelled.
+//
+// Returns true when this call was the one that cancelled the job; false means the
+// job did not exist or had already reached a terminal status, which callers treat
+// as a no-op rather than an error.
+func (s *RDBConfigStore) CancelSidekiqJob(ctx context.Context, id string) (bool, error) {
+	now := time.Now()
+	res := s.DB().WithContext(ctx).
+		Model(&tables.TableSidekiqJob{}).
+		Where("id = ? AND status IN ?", id, []string{tables.SidekiqStatusPending, tables.SidekiqStatusRunning}).
+		Updates(map[string]any{
+			"status":       tables.SidekiqStatusCancelled,
+			"updated_at":   now,
+			"completed_at": now,
+		})
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected == 1, nil
+}
+
+// FinalizeCancelledSidekiqJob stores the last metadata snapshot of a job that was
+// cancelled mid-run, so the partial progress counters (and the handler's summary
+// message) survive for the UI. It only touches the metadata: the status,
+// completed_at and last_error written by CancelSidekiqJob stand.
+//
+// Fenced on runner_id and status = cancelled so a stale runner cannot resurrect
+// counters onto a job that has since been re-claimed, and so a handler unwinding
+// for some other reason cannot mistakenly write here. A zero-row result is not an
+// error — the job may have been finalized already.
+func (s *RDBConfigStore) FinalizeCancelledSidekiqJob(ctx context.Context, id, runnerID, metadata string) error {
+	if metadata == "" {
+		return nil
+	}
+	return s.DB().WithContext(ctx).
+		Model(&tables.TableSidekiqJob{}).
+		Where("id = ? AND runner_id = ? AND status = ?", id, runnerID, tables.SidekiqStatusCancelled).
+		Updates(map[string]any{
+			"metadata":   metadata,
+			"updated_at": time.Now(),
+		}).Error
+}
+
 // ListClaimableSidekiqJobs returns jobs eligible to be picked up: those that are
 // pending (never started), or running but stale (heartbeat older than staleBefore,
 // i.e. their owner is presumed dead). Ordered oldest-first. The dispatcher scans
@@ -215,6 +307,52 @@ func (s *RDBConfigStore) GetInFlightSidekiqJobByKind(ctx context.Context, kind s
 		return nil, err
 	}
 	return &job, nil
+}
+
+// GetLatestSidekiqJobByKind returns the most recently created job of the given
+// kind in any status, or nil when none was ever enqueued. Status pages use it to
+// keep showing the last outcome (including a failure and its cause) after the
+// job has left the in-flight set, so a reload does not blank the result.
+func (s *RDBConfigStore) GetLatestSidekiqJobByKind(ctx context.Context, kind string) (*tables.TableSidekiqJob, error) {
+	var job tables.TableSidekiqJob
+	err := s.DB().WithContext(ctx).
+		Where("kind = ?", kind).
+		Order("created_at DESC").
+		First(&job).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+// ListSidekiqJobs returns every pending or running job plus the jobs that reached a
+// terminal status at or after terminalSince, newest first, capped at limit. It feeds
+// the notification panel: active work stays visible however old it is, while finished
+// jobs age out of the window instead of accumulating forever.
+//
+// A completed job of one of quietKinds is left out - routine work queued on a
+// timer - in the query rather than after it, so those jobs never take the
+// places limit leaves for the rest. Its failures and cancellations are listed.
+func (s *RDBConfigStore) ListSidekiqJobs(ctx context.Context, terminalSince time.Time, limit int, quietKinds []string) ([]tables.TableSidekiqJob, error) {
+	var jobs []tables.TableSidekiqJob
+	q := s.DB().WithContext(ctx).
+		Where("status IN ? OR (status IN ? AND completed_at >= ?)",
+			[]string{tables.SidekiqStatusPending, tables.SidekiqStatusRunning},
+			tables.SidekiqTerminalStatuses, terminalSince)
+	if len(quietKinds) > 0 {
+		q = q.Where("NOT (status = ? AND kind IN ?)", tables.SidekiqStatusCompleted, quietKinds)
+	}
+	q = q.Order("created_at DESC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Find(&jobs).Error; err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // MarkStaleSidekiqJobsFailed flips any running job whose heartbeat (updated_at) is

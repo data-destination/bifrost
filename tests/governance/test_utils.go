@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -30,12 +31,15 @@ var TestModels = map[string]ModelCost{
 		MaxInputTokens:     128000,
 		MaxOutputTokens:    16384,
 	},
-	"anthropic/claude-3-7-sonnet-20250219": {
+	// claude-3-7-sonnet-20250219 was retired by Anthropic (the API now returns
+	// 404 not_found_error for it); claude-sonnet-4-5 keeps the same $3/$15
+	// per-MTok pricing.
+	"anthropic/claude-sonnet-4-5": {
 		Provider:           "anthropic",
 		InputCostPerToken:  0.000003,
 		OutputCostPerToken: 0.000015,
 		MaxInputTokens:     200000,
-		MaxOutputTokens:    128000,
+		MaxOutputTokens:    64000,
 	},
 	"anthropic/claude-4-opus-20250514": {
 		Provider:           "anthropic",
@@ -85,12 +89,38 @@ type APIResponse struct {
 	StatusCode int
 	Body       map[string]interface{}
 	RawBody    []byte
+	Headers    http.Header // response headers, e.g. x-request-id for follow-up log lookups
 }
 
 // MakeRequest makes an HTTP request to the Bifrost API
+// baseURL is the gateway the governance suite exercises.
+//
+// Overridable so a run can target a gateway other than the default dev one, for
+// example an instance started with provider credentials in scope while a
+// developer's own gateway keeps port 8080. Defaults to the historical value, so
+// nothing changes for an unconfigured run.
+func baseURL() string {
+	if override := os.Getenv("BIFROST_TEST_BASE_URL"); override != "" {
+		return strings.TrimSuffix(override, "/")
+	}
+	return "http://localhost:8080"
+}
+
+// setupToken returns the OSS setup token the governance test server is configured with
+// (tests/governance/config.json setup_token), overridable through the environment.
+func setupToken() string {
+	if v := os.Getenv("BIFROST_E2E_SETUP_TOKEN"); v != "" {
+		return v
+	}
+	if v := os.Getenv("BIFROST_SETUP_TOKEN"); v != "" {
+		return v
+	}
+	return "bifrost-e2e-setup-token"
+}
+
 func MakeRequest(t *testing.T, req APIRequest) *APIResponse {
 	client := &http.Client{}
-	url := fmt.Sprintf("http://localhost:8080%s", req.Path)
+	url := fmt.Sprintf("%s%s", baseURL(), req.Path)
 
 	var body io.Reader
 	if req.Body != nil {
@@ -107,6 +137,8 @@ func MakeRequest(t *testing.T, req APIRequest) *APIResponse {
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	// OSS setup lock: /api needs the setup token while dashboard auth is not active.
+	httpReq.Header.Set("X-Bifrost-Setup-Token", setupToken())
 
 	// Add virtual key header if provided
 	if req.VKHeader != nil {
@@ -137,6 +169,7 @@ func MakeRequest(t *testing.T, req APIRequest) *APIResponse {
 		StatusCode: resp.StatusCode,
 		Body:       responseBody,
 		RawBody:    rawBody,
+		Headers:    resp.Header,
 	}
 }
 
@@ -144,7 +177,7 @@ func MakeRequest(t *testing.T, req APIRequest) *APIResponse {
 // Use this when you need to test specific header formats (e.g., Authorization, x-api-key)
 func MakeRequestWithCustomHeaders(t *testing.T, req APIRequest, customHeaders map[string]string) *APIResponse {
 	client := &http.Client{}
-	url := fmt.Sprintf("http://localhost:8080%s", req.Path)
+	url := fmt.Sprintf("%s%s", baseURL(), req.Path)
 
 	var body io.Reader
 	if req.Body != nil {
@@ -161,6 +194,8 @@ func MakeRequestWithCustomHeaders(t *testing.T, req APIRequest, customHeaders ma
 	}
 
 	httpReq.Header.Set("Content-Type", "application/json")
+	// OSS setup lock: /api needs the setup token while dashboard auth is not active.
+	httpReq.Header.Set("X-Bifrost-Setup-Token", setupToken())
 
 	// Add custom headers
 	for key, value := range customHeaders {
@@ -207,14 +242,18 @@ func generateRandomID() string {
 
 // CreateVirtualKeyRequest represents a request to create a virtual key
 type CreateVirtualKeyRequest struct {
-	Name            string                  `json:"name"`
-	Description     string                  `json:"description,omitempty"`
-	IsActive        *bool                   `json:"is_active,omitempty"`
-	TeamID          *string                 `json:"team_id,omitempty"`
-	CustomerID      *string                 `json:"customer_id,omitempty"`
-	Budgets         []BudgetRequest         `json:"budgets,omitempty"`
-	RateLimit       *CreateRateLimitRequest `json:"rate_limit,omitempty"`
-	ProviderConfigs []ProviderConfigRequest `json:"provider_configs,omitempty"`
+	Name              string                  `json:"name"`
+	Description       string                  `json:"description,omitempty"`
+	IsActive          *bool                   `json:"is_active,omitempty"`
+	TeamID            *string                 `json:"team_id,omitempty"`
+	CustomerID        *string                 `json:"customer_id,omitempty"`
+	Budgets           []BudgetRequest         `json:"budgets,omitempty"`
+	RateLimit         *CreateRateLimitRequest `json:"rate_limit,omitempty"`
+	ProviderConfigs   []ProviderConfigRequest `json:"provider_configs,omitempty"`
+	CalendarAligned   bool                    `json:"calendar_aligned,omitempty"`
+	AllowAllProviders bool                    `json:"allow_all_providers,omitempty"`
+	// DisableContentLogging is tri-state: nil inherits the client setting, true forces content off.
+	DisableContentLogging *bool `json:"disable_content_logging,omitempty"`
 }
 
 // ProviderConfigRequest represents a provider configuration for a virtual key
@@ -237,19 +276,31 @@ func float64Ptr(v float64) *float64 {
 type BudgetRequest struct {
 	MaxLimit      float64 `json:"max_limit"`
 	ResetDuration string  `json:"reset_duration"`
+	// ResetConfig carries window settings the duration cannot express, currently
+	// the fiscal quarter start. Only valid on a quarterly ("1Q") duration.
+	ResetConfig *BudgetResetConfigRequest `json:"reset_config,omitempty"`
+}
+
+// BudgetResetConfigRequest mirrors tables.BudgetResetConfig on the wire.
+type BudgetResetConfigRequest struct {
+	QuarterStartMonth int `json:"quarter_start_month,omitempty"`
 }
 
 // CreateTeamRequest represents a request to create a team
 type CreateTeamRequest struct {
-	Name       string          `json:"name"`
-	CustomerID *string         `json:"customer_id,omitempty"`
-	Budgets    []BudgetRequest `json:"budgets,omitempty"`
+	Name            string                  `json:"name"`
+	CustomerID      *string                 `json:"customer_id,omitempty"`
+	Budgets         []BudgetRequest         `json:"budgets,omitempty"`
+	RateLimit       *CreateRateLimitRequest `json:"rate_limit,omitempty"`
+	CalendarAligned bool                    `json:"calendar_aligned,omitempty"`
 }
 
 // CreateCustomerRequest represents a request to create a customer
 type CreateCustomerRequest struct {
-	Name    string          `json:"name"`
-	Budgets []BudgetRequest `json:"budgets,omitempty"`
+	Name            string                  `json:"name"`
+	Budgets         []BudgetRequest         `json:"budgets,omitempty"`
+	RateLimit       *CreateRateLimitRequest `json:"rate_limit,omitempty"`
+	CalendarAligned bool                    `json:"calendar_aligned,omitempty"`
 }
 
 // UpdateBudgetRequest represents a request to update a budget
@@ -275,6 +326,9 @@ type UpdateVirtualKeyRequest struct {
 	RateLimit       *CreateRateLimitRequest `json:"rate_limit,omitempty"`
 	IsActive        *bool                   `json:"is_active,omitempty"`
 	ProviderConfigs []ProviderConfigRequest `json:"provider_configs,omitempty"`
+	CalendarAligned *bool                   `json:"calendar_aligned,omitempty"`
+	// ResetBudgetUsage zeroes accumulated spend on the reconciled budgets.
+	ResetBudgetUsage *bool `json:"reset_budget_usage,omitempty"`
 }
 
 // UpdateTeamRequest represents a request to update a team
@@ -285,12 +339,48 @@ type UpdateTeamRequest struct {
 	//   &[]BudgetRequest{}   → explicit empty array (server clears all budgets)
 	//   &[]BudgetRequest{…}  → replace with the provided budgets
 	Budgets *[]BudgetRequest `json:"budgets,omitempty"`
+	// CalendarAligned toggles calendar-aligned resets for the team's budgets and
+	// rate limit. Pointer so a test can distinguish "leave unchanged" from an
+	// explicit false.
+	CalendarAligned *bool `json:"calendar_aligned,omitempty"`
+	// ResetBudgetUsage zeroes accumulated spend on the reconciled budgets.
+	ResetBudgetUsage *bool `json:"reset_budget_usage,omitempty"`
 }
 
 // UpdateCustomerRequest represents a request to update a customer
 type UpdateCustomerRequest struct {
-	Name    *string         `json:"name,omitempty"`
-	Budgets []BudgetRequest `json:"budgets,omitempty"`
+	Name            *string         `json:"name,omitempty"`
+	Budgets         []BudgetRequest `json:"budgets,omitempty"`
+	CalendarAligned *bool           `json:"calendar_aligned,omitempty"`
+	// ResetBudgetUsage zeroes accumulated spend on the reconciled budgets.
+	ResetBudgetUsage *bool `json:"reset_budget_usage,omitempty"`
+}
+
+// CreateModelConfigRequest represents a request to create a model-scoped limit.
+type CreateModelConfigRequest struct {
+	ModelName string                  `json:"model_name"`
+	Provider  *string                 `json:"provider,omitempty"`
+	Scope     string                  `json:"scope,omitempty"`
+	ScopeID   *string                 `json:"scope_id,omitempty"`
+	Budgets   []BudgetRequest         `json:"budgets,omitempty"`
+	RateLimit *CreateRateLimitRequest `json:"rate_limit,omitempty"`
+}
+
+// UpdateModelConfigRequest represents a request to update a model-scoped limit.
+type UpdateModelConfigRequest struct {
+	ModelName *string         `json:"model_name,omitempty"`
+	Provider  *string         `json:"provider,omitempty"`
+	Budgets   []BudgetRequest `json:"budgets,omitempty"`
+	// ResetBudgetUsage zeroes accumulated spend on the reconciled budgets.
+	ResetBudgetUsage *bool `json:"reset_budget_usage,omitempty"`
+}
+
+// UpdateProviderGovernanceRequest represents a request to update provider-level governance.
+type UpdateProviderGovernanceRequest struct {
+	Budgets         *[]BudgetRequest `json:"budgets,omitempty"`
+	CalendarAligned *bool            `json:"calendar_aligned,omitempty"`
+	// ResetBudgetUsage zeroes accumulated spend on the reconciled budgets.
+	ResetBudgetUsage *bool `json:"reset_budget_usage,omitempty"`
 }
 
 // ChatCompletionRequest represents an OpenAI-compatible chat completion request

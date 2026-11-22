@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,9 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // setupOAuth2TestStore extends the base in-memory store with the OAuth2 issuance
@@ -62,28 +66,30 @@ func makeRefreshToken(id, familyID, clientID, hash string) *tables.TableOAuth2Re
 
 // seedExpiringTokenFixtures installs the token/config/client helpers shared by
 // the GetExpiringOauthTokens tests. Every token is created already-expired so
-// only the config/client conditions decide whether it is selected.
-func seedExpiringTokenFixtures(t *testing.T, s *RDBConfigStore) (mkToken func(id string), mkConfig func(id, tokenID, status, state string), mkClient func(name, oauthConfigID string, disabled bool)) {
+// only the token-status/client conditions decide whether it is selected.
+// Tokens link to their owning config via OauthConfigID — the replacement for
+// the retired TableOauthConfig.TokenID FK shortcut.
+func seedExpiringTokenFixtures(t *testing.T, s *RDBConfigStore) (mkToken func(id, oauthConfigID, status string), mkConfig func(id string), mkClient func(name, oauthConfigID string, disabled bool)) {
 	t.Helper()
-	require.NoError(t, s.DB().AutoMigrate(&tables.TableOauthConfig{}, &tables.TableOauthToken{}, &tables.TableMCPClient{}))
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableOauthConfig{}, &tables.TableMCPOauthToken{}, &tables.TableMCPClient{}))
 	past := time.Now().Add(-time.Hour)
 
-	mkToken = func(id string) {
-		require.NoError(t, s.DB().Create(&tables.TableOauthToken{
-			ID: id, AccessToken: "at-" + id, TokenType: "Bearer",
+	mkToken = func(id, oauthConfigID, status string) {
+		require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+			ID: id, AuthMode: "shared", OauthConfigID: oauthConfigID, Status: status,
+			AccessToken: "at-" + id, TokenType: "Bearer",
 			ExpiresAt: &past, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}).Error)
 	}
-	mkConfig = func(id, tokenID, status, state string) {
+	mkConfig = func(id string) {
 		require.NoError(t, s.DB().Create(&tables.TableOauthConfig{
-			ID: id, RedirectURI: "http://127.0.0.1/cb", State: state, Status: status,
-			TokenID: &tokenID, CreatedAt: time.Now(), UpdatedAt: time.Now(),
-			ExpiresAt: time.Now().Add(time.Hour),
+			ID: id, RedirectURI: "http://127.0.0.1/cb", Status: "authorized",
+			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}).Error)
 	}
 	mkClient = func(name, oauthConfigID string, disabled bool) {
 		require.NoError(t, s.DB().Create(&tables.TableMCPClient{
-			ClientID: "cid-" + name, Name: name, ConnectionType: "http",
+			ClientID: "cid-" + name, Name: name, EndpointSlug: "cid-" + name, ConnectionType: "http",
 			AuthType: "oauth", OauthConfigID: &oauthConfigID, Disabled: disabled,
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}).Error)
@@ -93,7 +99,7 @@ func seedExpiringTokenFixtures(t *testing.T, s *RDBConfigStore) (mkToken func(id
 
 func expiringTokenIDs(t *testing.T, s *RDBConfigStore) map[string]bool {
 	t.Helper()
-	got, err := s.GetExpiringOauthTokens(context.Background(), time.Now().Add(time.Minute))
+	got, err := s.GetExpiringOauthTokens(context.Background(), time.Now().Add(time.Minute), []string{"shared"})
 	require.NoError(t, err)
 	ids := make(map[string]bool, len(got))
 	for _, tk := range got {
@@ -102,28 +108,69 @@ func expiringTokenIDs(t *testing.T, s *RDBConfigStore) map[string]bool {
 	return ids
 }
 
-// TestGetExpiringOauthTokens_ExcludesTerminalConfigs verifies the refresh worker
-// query skips tokens whose oauth_config is already terminal (expired/revoked), so
-// a permanently-dead grant is not retried — and re-logged — on every tick. Each
-// config gets an enabled MCP client so status is the only deciding condition.
-func TestGetExpiringOauthTokens_ExcludesTerminalConfigs(t *testing.T) {
+// TestGetExpiringOauthTokens_ExcludesNonActiveTokens verifies the refresh
+// worker query skips tokens whose own status is already 'needs_reauth', so a
+// permanently-dead grant is not retried — and re-logged — on every tick. Each
+// config gets an enabled MCP client so token status is the only deciding
+// condition.
+func TestGetExpiringOauthTokens_ExcludesNonActiveTokens(t *testing.T) {
 	s := setupRDBTestStore(t)
 	mkToken, mkConfig, mkClient := seedExpiringTokenFixtures(t, s)
 
-	mkToken("tok-live")
-	mkConfig("cfg-live", "tok-live", "authorized", "state-live")
+	mkConfig("cfg-live")
+	mkToken("tok-live", "cfg-live", "active")
 	mkClient("client-live", "cfg-live", false)
-	mkToken("tok-expired")
-	mkConfig("cfg-expired", "tok-expired", "expired", "state-expired")
-	mkClient("client-expired", "cfg-expired", false)
-	mkToken("tok-revoked")
-	mkConfig("cfg-revoked", "tok-revoked", "revoked", "state-revoked")
-	mkClient("client-revoked", "cfg-revoked", false)
+
+	mkConfig("cfg-needs-reauth")
+	mkToken("tok-needs-reauth", "cfg-needs-reauth", "needs_reauth")
+	mkClient("client-needs-reauth", "cfg-needs-reauth", false)
 
 	ids := expiringTokenIDs(t, s)
-	assert.True(t, ids["tok-live"], "token with an authorized config and enabled client should be refreshed")
-	assert.False(t, ids["tok-expired"], "token with an expired config must be excluded")
-	assert.False(t, ids["tok-revoked"], "token with a revoked config must be excluded")
+	assert.True(t, ids["tok-live"], "active token with an enabled client should be refreshed")
+	assert.False(t, ids["tok-needs-reauth"], "token already marked needs_reauth must be excluded")
+}
+
+// TestGetExpiringOauthTokens_FiltersByAuthMode verifies the caller-supplied
+// authModes slice, not a hardcoded "shared" clause, decides which token
+// holder types come back. With authModes=["shared"] (TokenRefreshWorker's
+// default), a same-config, same-expiry "user"-mode row must not be picked up
+// — the coverage the old hardcoded `auth_mode = 'shared'` filter gave for
+// free, now expressed as an explicit parameter instead.
+func TestGetExpiringOauthTokens_FiltersByAuthMode(t *testing.T) {
+	s := setupRDBTestStore(t)
+	mkToken, mkConfig, mkClient := seedExpiringTokenFixtures(t, s)
+	past := time.Now().Add(-time.Hour)
+
+	mkConfig("cfg-mixed")
+	mkToken("tok-shared", "cfg-mixed", "active")
+	mkClient("client-mixed", "cfg-mixed", false)
+	require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+		ID: "tok-user", AuthMode: "user", OauthConfigID: "cfg-mixed", Status: "active",
+		AccessToken: "at-tok-user", TokenType: "Bearer",
+		ExpiresAt: &past, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Error)
+
+	shared, err := s.GetExpiringOauthTokens(context.Background(), time.Now().Add(time.Minute), []string{"shared"})
+	require.NoError(t, err)
+	sharedIDs := make(map[string]bool, len(shared))
+	for _, tk := range shared {
+		sharedIDs[tk.ID] = true
+	}
+	assert.True(t, sharedIDs["tok-shared"], "shared token must be returned when authModes=[shared]")
+	assert.False(t, sharedIDs["tok-user"], "user-mode token must be excluded when authModes=[shared]")
+
+	both, err := s.GetExpiringOauthTokens(context.Background(), time.Now().Add(time.Minute), []string{"shared", "user"})
+	require.NoError(t, err)
+	bothIDs := make(map[string]bool, len(both))
+	for _, tk := range both {
+		bothIDs[tk.ID] = true
+	}
+	assert.True(t, bothIDs["tok-shared"], "shared token must be returned when authModes=[shared,user]")
+	assert.True(t, bothIDs["tok-user"], "user-mode token must be returned when authModes=[shared,user]")
+
+	empty, err := s.GetExpiringOauthTokens(context.Background(), time.Now().Add(time.Minute), nil)
+	require.NoError(t, err)
+	assert.Empty(t, empty, "an empty authModes must match nothing rather than falling back to all modes")
 }
 
 // TestGetExpiringOauthTokens_RequiresEnabledClient verifies the refresh worker
@@ -134,23 +181,23 @@ func TestGetExpiringOauthTokens_RequiresEnabledClient(t *testing.T) {
 	s := setupRDBTestStore(t)
 	mkToken, mkConfig, mkClient := seedExpiringTokenFixtures(t, s)
 
-	mkToken("tok-enabled")
-	mkConfig("cfg-enabled", "tok-enabled", "authorized", "state-enabled")
+	mkConfig("cfg-enabled")
+	mkToken("tok-enabled", "cfg-enabled", "active")
 	mkClient("client-enabled", "cfg-enabled", false)
 
-	mkToken("tok-disabled")
-	mkConfig("cfg-disabled", "tok-disabled", "authorized", "state-disabled")
+	mkConfig("cfg-disabled")
+	mkToken("tok-disabled", "cfg-disabled", "active")
 	mkClient("client-disabled", "cfg-disabled", true)
 
-	mkToken("tok-shared")
-	mkConfig("cfg-shared", "tok-shared", "authorized", "state-shared")
+	mkConfig("cfg-shared")
+	mkToken("tok-shared", "cfg-shared", "active")
 	mkClient("client-shared-off", "cfg-shared", true)
 	mkClient("client-shared-on", "cfg-shared", false)
 
-	mkToken("tok-no-client")
-	mkConfig("cfg-no-client", "tok-no-client", "authorized", "state-no-client")
+	mkConfig("cfg-no-client")
+	mkToken("tok-no-client", "cfg-no-client", "active")
 
-	mkToken("tok-orphan") // no owning config at all
+	mkToken("tok-orphan", "", "active") // no owning config at all
 
 	ids := expiringTokenIDs(t, s)
 	assert.True(t, ids["tok-enabled"], "token with an enabled client should be refreshed")
@@ -158,6 +205,64 @@ func TestGetExpiringOauthTokens_RequiresEnabledClient(t *testing.T) {
 	assert.True(t, ids["tok-shared"], "config shared with at least one enabled client should be refreshed")
 	assert.False(t, ids["tok-no-client"], "token whose config has no client rows must be excluded")
 	assert.False(t, ids["tok-orphan"], "token with no owning config must be excluded")
+}
+
+// TestCreateOauthToken_AdminMode_UpsertsByMCPClientIDNotDuplicate guards the
+// gap CodeRabbit flagged in CreateOauthToken's upsert-lookup switch: an
+// admin-mode token (no UserID/VirtualKeyID/SessionID, bound only by
+// MCPClientID — see InitiateUserOAuthFlow's MCPAuthModeAdmin case) matched no
+// case and fell through to the default "not found" branch, so every call
+// always inserted a fresh row instead of reusing the existing binding's row.
+// RetainExchangeAdminCredential calls CreateOauthToken with exactly this
+// shape on every token_exchange admin-credential repair, and its own doc
+// comment promises "a repair replaces the existing row's credential" — this
+// pins that an admin-mode call is a true upsert, not an unconditional insert.
+func TestCreateOauthToken_AdminMode_UpsertsByMCPClientIDNotDuplicate(t *testing.T) {
+	s := setupRDBTestStore(t)
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableMCPOauthToken{}))
+	ctx := context.Background()
+
+	first := &tables.TableMCPOauthToken{
+		ID:          "tok-admin-1",
+		AuthMode:    "admin",
+		MCPClientID: "client-1",
+		AccessToken: "first-access-token",
+		TokenType:   "Bearer",
+		Status:      "active",
+	}
+	require.NoError(t, s.CreateOauthToken(ctx, first))
+
+	// A second call for the same (auth_mode='admin', mcp_client_id) binding —
+	// a repair, per RetainExchangeAdminCredential's own doc comment — must
+	// update the existing row, not insert a second one.
+	second := &tables.TableMCPOauthToken{
+		ID:          "tok-admin-2",
+		AuthMode:    "admin",
+		MCPClientID: "client-1",
+		AccessToken: "second-access-token",
+		TokenType:   "Bearer",
+		Status:      "active",
+	}
+	require.NoError(t, s.CreateOauthToken(ctx, second))
+
+	var rows []tables.TableMCPOauthToken
+	require.NoError(t, s.DB().Where("auth_mode = ? AND mcp_client_id = ?", "admin", "client-1").Find(&rows).Error)
+	require.Len(t, rows, 1, "must reuse the existing row for this binding, not insert a duplicate")
+	assert.Equal(t, "second-access-token", rows[0].AccessToken, "the repair's new credential must win")
+
+	// A different mcp_client_id is a different binding — it must get its own row.
+	other := &tables.TableMCPOauthToken{
+		ID:          "tok-admin-3",
+		AuthMode:    "admin",
+		MCPClientID: "client-2",
+		AccessToken: "other-client-access-token",
+		TokenType:   "Bearer",
+		Status:      "active",
+	}
+	require.NoError(t, s.CreateOauthToken(ctx, other))
+	var allAdminRows []tables.TableMCPOauthToken
+	require.NoError(t, s.DB().Where("auth_mode = ?", "admin").Find(&allAdminRows).Error)
+	assert.Len(t, allAdminRows, 2, "a different mcp_client_id must not reuse another client's admin row")
 }
 
 func TestGetOAuth2SigningKey_AutoGeneratesAndIsStable(t *testing.T) {
@@ -209,6 +314,79 @@ func TestConsentOAuth2AuthorizeRequest_AtomicPendingTransition(t *testing.T) {
 	got, err = s.GetOAuth2AuthorizeRequestByID(ctx, "req-1")
 	require.NoError(t, err)
 	assert.Equal(t, "code-hash-1", *got.CodeHash)
+}
+
+// TestDenyOAuth2AuthorizeRequest_OnlyFromPending pins that refusing a sign-in on the consent page
+// moves a pending request to revoked, and never undoes a consent that already won.
+func TestDenyOAuth2AuthorizeRequest_OnlyFromPending(t *testing.T) {
+	s := setupOAuth2TestStore(t)
+	ctx := context.Background()
+	seedAuthorizeRequest(t, s, "req-pending", tables.OAuth2AuthorizeRequestStatusPending, nil, time.Now().Add(time.Minute))
+	seedAuthorizeRequest(t, s, "req-consented", tables.OAuth2AuthorizeRequestStatusConsented, nil, time.Now().Add(time.Minute))
+
+	require.NoError(t, s.DenyOAuth2AuthorizeRequest(ctx, "req-pending"))
+	got, err := s.GetOAuth2AuthorizeRequestByID(ctx, "req-pending")
+	require.NoError(t, err)
+	assert.Equal(t, tables.OAuth2AuthorizeRequestStatusRevoked, got.Status)
+
+	assert.ErrorIs(t, s.DenyOAuth2AuthorizeRequest(ctx, "req-pending"), ErrNotFound, "a refused request cannot be refused again")
+	assert.ErrorIs(t, s.DenyOAuth2AuthorizeRequest(ctx, "req-consented"), ErrNotFound, "a consented request is not undone")
+	got, err = s.GetOAuth2AuthorizeRequestByID(ctx, "req-consented")
+	require.NoError(t, err)
+	assert.Equal(t, tables.OAuth2AuthorizeRequestStatusConsented, got.Status)
+	assert.ErrorIs(t, s.DenyOAuth2AuthorizeRequest(ctx, "missing"), ErrNotFound)
+}
+
+func TestOAuth2AuthorizeRequest_DeviceCodeLookups(t *testing.T) {
+	s := setupOAuth2TestStore(t)
+	ctx := context.Background()
+	seedDevice := func(id, deviceHash, userHash string, status tables.OAuth2AuthorizeRequestStatus, expires time.Time) {
+		require.NoError(t, s.CreateOAuth2AuthorizeRequest(ctx, &tables.TableOAuth2AuthorizeRequest{
+			ID: id, ClientID: "bifrost-claude-code", Resource: "https://bifrost.test/gateway/claude-code", Status: status,
+			DeviceCodeHash: strPtr(deviceHash), UserCodeHash: strPtr(userHash),
+			ExpiresAt: expires, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		}))
+	}
+	seedDevice("dev-pending", "device-1", "user-1", tables.OAuth2AuthorizeRequestStatusPending, time.Now().Add(time.Minute))
+	seedDevice("dev-consented", "device-2", "user-2", tables.OAuth2AuthorizeRequestStatusConsented, time.Now().Add(time.Minute))
+	seedDevice("dev-expired", "device-3", "user-3", tables.OAuth2AuthorizeRequestStatusPending, time.Now().Add(-time.Minute))
+	// Authorization-code rows leave both columns NULL; many may coexist under the unique indexes.
+	seedAuthorizeRequest(t, s, "code-1", tables.OAuth2AuthorizeRequestStatusPending, nil, time.Now().Add(time.Minute))
+	seedAuthorizeRequest(t, s, "code-2", tables.OAuth2AuthorizeRequestStatusPending, nil, time.Now().Add(time.Minute))
+
+	// The device-code lookup returns the row in any status, so polling can tell pending from consented.
+	for hash, id := range map[string]string{"device-1": "dev-pending", "device-2": "dev-consented", "device-3": "dev-expired"} {
+		got, err := s.GetOAuth2AuthorizeRequestByDeviceCodeHash(ctx, hash)
+		require.NoError(t, err)
+		assert.Equal(t, id, got.ID)
+	}
+	_, err := s.GetOAuth2AuthorizeRequestByDeviceCodeHash(ctx, "missing")
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	// The user-code lookup only finds a still-pending, unexpired sign-in.
+	got, err := s.GetPendingOAuth2AuthorizeRequestByUserCodeHash(ctx, "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, "dev-pending", got.ID)
+	for _, hash := range []string{"user-2", "user-3", "missing"} {
+		_, err := s.GetPendingOAuth2AuthorizeRequestByUserCodeHash(ctx, hash)
+		assert.ErrorIs(t, err, ErrNotFound, hash)
+	}
+
+	// Device codes are unique.
+	err = s.CreateOAuth2AuthorizeRequest(ctx, &tables.TableOAuth2AuthorizeRequest{
+		ID: "dev-dup", ClientID: "bifrost-claude-code", Status: tables.OAuth2AuthorizeRequestStatusPending,
+		DeviceCodeHash: strPtr("device-1"), ExpiresAt: time.Now().Add(time.Minute), CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	})
+	assert.Error(t, err)
+
+	// Consent without a code hash (the device-grant path) completes the row.
+	require.NoError(t, s.ConsentOAuth2AuthorizeRequest(ctx, &tables.TableOAuth2AuthorizeRequest{
+		ID: "dev-pending", BfMode: "vk", BfSub: "vk-1", UpdatedAt: time.Now(),
+	}))
+	got, err = s.GetOAuth2AuthorizeRequestByDeviceCodeHash(ctx, "device-1")
+	require.NoError(t, err)
+	assert.Equal(t, tables.OAuth2AuthorizeRequestStatusConsented, got.Status)
+	assert.Nil(t, got.CodeHash)
 }
 
 func TestConsumeOAuth2AuthorizeRequest_SingleUse(t *testing.T) {
@@ -280,10 +458,12 @@ func TestRevokeOAuth2RefreshTokensByFamilyID(t *testing.T) {
 	require.NoError(t, s.DB().Create(makeRefreshToken("b", "fam-1", "c", "hb")).Error)
 	require.NoError(t, s.DB().Create(makeRefreshToken("c", "fam-2", "c", "hc")).Error)
 
-	require.NoError(t, s.RevokeOAuth2RefreshTokensByFamilyID(ctx, "fam-1"))
+	n, err := s.RevokeOAuth2RefreshTokensByFamilyID(ctx, "fam-1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
 
 	// fam-1 fully revoked; fam-2 untouched.
-	_, err := s.GetOAuth2RefreshTokenByHash(ctx, "ha")
+	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "ha")
 	assert.ErrorIs(t, err, ErrNotFound)
 	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "hb")
 	assert.ErrorIs(t, err, ErrNotFound)
@@ -419,6 +599,89 @@ func TestRevokeOAuth2RefreshTokensByMode(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestRevokeOAuth2GrantsBySubject(t *testing.T) {
+	s := setupOAuth2TestStore(t)
+	ctx := context.Background()
+	target := makeRefreshToken("v1", "f1", "c", "h-target") // vk / vk-1 from helper default
+	targetOther := makeRefreshToken("v2", "f2", "c", "h-target-2")
+	otherVK := makeRefreshToken("v3", "f3", "c", "h-other-vk")
+	otherVK.BfSub = "vk-2"
+	sameSubOtherMode := makeRefreshToken("u1", "f4", "c", "h-user")
+	sameSubOtherMode.BfMode = "user"
+	for _, rt := range []*tables.TableOAuth2RefreshToken{target, targetOther, otherVK, sameSubOtherMode} {
+		require.NoError(t, s.DB().Create(rt).Error)
+	}
+
+	// Consented-but-unredeemed authorization codes are grants too: one for the
+	// subject being revoked, one for another key.
+	future := time.Now().Add(time.Minute)
+	for _, ar := range []*tables.TableOAuth2AuthorizeRequest{
+		{ID: "ar-vk1", ClientID: "c", RedirectURI: "http://127.0.0.1/cb", State: "s", Scope: "mcp", Resource: "https://bifrost.test/mcp", CodeChallenge: "ch", CodeChallengeMethod: "S256", Status: tables.OAuth2AuthorizeRequestStatusConsented, CodeHash: strPtr("code-vk1"), BfMode: "vk", BfSub: "vk-1", ExpiresAt: future, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+		{ID: "ar-vk2", ClientID: "c", RedirectURI: "http://127.0.0.1/cb", State: "s", Scope: "mcp", Resource: "https://bifrost.test/mcp", CodeChallenge: "ch", CodeChallengeMethod: "S256", Status: tables.OAuth2AuthorizeRequestStatusConsented, CodeHash: strPtr("code-vk2"), BfMode: "vk", BfSub: "vk-2", ExpiresAt: future, CreatedAt: time.Now(), UpdatedAt: time.Now()},
+	} {
+		require.NoError(t, s.DB().Create(ar).Error)
+	}
+
+	revoked, err := s.RevokeOAuth2GrantsBySubject(ctx, "vk", "vk-1")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), revoked, "both of the subject's active refresh tokens are counted")
+
+	// The subject's pending code can no longer be exchanged; another key's still can.
+	err = s.ConsumeOAuth2AuthorizeRequest(ctx, "ar-vk1", makeRefreshToken("v-new-1", "ar-vk1", "c", "h-new-1"))
+	assert.ErrorIs(t, err, ErrNotFound, "a consented code for the revoked subject must not mint a new grant")
+	otherKeyToken := makeRefreshToken("v-new-2", "ar-vk2", "c", "h-new-2")
+	otherKeyToken.BfSub = "vk-2"
+	require.NoError(t, s.ConsumeOAuth2AuthorizeRequest(ctx, "ar-vk2", otherKeyToken))
+	minted, err := s.GetOAuth2RefreshTokenByHash(ctx, "h-new-2")
+	require.NoError(t, err)
+	assert.Equal(t, "vk-2", minted.BfSub, "the other key's code mints a grant for the other key")
+
+	// Every active grant of that identity is revoked, across families...
+	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "h-target")
+	assert.ErrorIs(t, err, ErrNotFound)
+	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "h-target-2")
+	assert.ErrorIs(t, err, ErrNotFound)
+	// ...while another key's grants and the same subject under another mode survive.
+	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "h-other-vk")
+	require.NoError(t, err)
+	_, err = s.GetOAuth2RefreshTokenByHash(ctx, "h-user")
+	require.NoError(t, err)
+
+	// Idempotent on an identity with nothing left to revoke.
+	revoked, err = s.RevokeOAuth2GrantsBySubject(ctx, "vk", "vk-1")
+	require.NoError(t, err)
+	assert.Zero(t, revoked)
+}
+
+// TestRevokeOAuth2GrantsBySubjectEndsCodesFirst: a revoked identity's consented codes move to a
+// terminal status (not merely an earlier expiry), and they are ended before its refresh tokens are
+// revoked, so an exchange that commits while revocation runs either finds its code already ended or
+// mints a token the later revocation still sees.
+func TestRevokeOAuth2GrantsBySubjectEndsCodesFirst(t *testing.T) {
+	s := setupOAuth2TestStore(t)
+	ctx := context.Background()
+	require.NoError(t, s.DB().Create(makeRefreshToken("v1", "f1", "c", "h-target")).Error)
+	require.NoError(t, s.DB().Create(&tables.TableOAuth2AuthorizeRequest{
+		ID: "ar-vk1", ClientID: "c", RedirectURI: "http://127.0.0.1/cb", State: "s", Scope: "mcp", Resource: "https://bifrost.test/mcp",
+		CodeChallenge: "ch", CodeChallengeMethod: "S256", Status: tables.OAuth2AuthorizeRequestStatusConsented, CodeHash: strPtr("code-vk1"),
+		BfMode: "vk", BfSub: "vk-1", ExpiresAt: time.Now().Add(time.Minute), CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Error)
+
+	var updated []string
+	require.NoError(t, s.DB().Callback().Update().After("gorm:update").Register("test:record_update_order", func(db *gorm.DB) {
+		updated = append(updated, db.Statement.Table)
+	}))
+	t.Cleanup(func() { _ = s.DB().Callback().Update().Remove("test:record_update_order") })
+
+	_, err := s.RevokeOAuth2GrantsBySubject(ctx, "vk", "vk-1")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"oauth2_authorize_requests", "oauth2_refresh_tokens"}, updated, "codes are ended before tokens are revoked")
+	ar, err := s.GetOAuth2AuthorizeRequestByID(ctx, "ar-vk1")
+	require.NoError(t, err)
+	assert.Equal(t, tables.OAuth2AuthorizeRequestStatusRevoked, ar.Status, "a revoked code is in a terminal status, not merely expired")
+}
+
 func TestListOAuth2Sessions_JoinsAndExcludesRevoked(t *testing.T) {
 	s := setupOAuth2TestStore(t)
 	ctx := context.Background()
@@ -463,6 +726,26 @@ func TestListOAuth2Sessions_JoinsAndExcludesRevoked(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNotFound)
 	// Revoking an already-revoked grant reports not-found.
 	assert.ErrorIs(t, s.RevokeOAuth2Session(ctx, "rt-dead"), ErrNotFound)
+}
+
+// A Client ID Metadata Document client has no oauth2_clients row: its grant lists, and is found by, the
+// name it was consented under.
+func TestListOAuth2Sessions_MetadataDocumentClientName(t *testing.T) {
+	s := setupOAuth2TestStore(t)
+	ctx := context.Background()
+	tok := makeRefreshToken("rt-cimd", "f-cimd", "https://app.example.com/oauth/client.json", "h-cimd")
+	tok.ClientDisplayName = "Example App"
+	require.NoError(t, s.DB().Create(tok).Error)
+
+	rows, _, err := s.ListOAuth2Sessions(ctx, OAuth2SessionsQueryParams{})
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "Example App", rows[0].ClientName)
+
+	rows, total, err := s.ListOAuth2Sessions(ctx, OAuth2SessionsQueryParams{Search: "example app"})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), total, "search finds the grant by its consented name")
+	require.Len(t, rows, 1)
 }
 
 // TestListOAuth2Sessions_FilterAndPaginate pins the DB-side filtering +
@@ -610,4 +893,329 @@ func TestSweepConvergence_TokenSweepThenClientSweep(t *testing.T) {
 	assert.Equal(t, int64(1), deleted)
 	_, err = s.GetOAuth2ClientByClientID(ctx, "revoked-only")
 	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+// TestRefreshOauthTokenFieldsIfActive_CAS verifies the compare-and-swap guard:
+// a write only commits while the row's stored refresh_token still matches the
+// value the caller redeemed upstream (expectedPriorRefreshToken). This is what
+// prevents two concurrent refreshes of the same row — e.g. from two different
+// cluster nodes racing the same MCP client's periodic connection checker —
+// from clobbering each other: whichever one wins the race and writes first
+// advances the row's refresh_token, and the loser's write (still carrying the
+// now-superseded prior value) is rejected instead of overwriting the winner's
+// fresher credentials.
+func TestRefreshOauthTokenFieldsIfActive_CAS(t *testing.T) {
+	s := setupRDBTestStore(t)
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableMCPOauthToken{}))
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+		ID: "tok-1", AuthMode: "shared", OauthConfigID: "cfg-1", Status: "active",
+		AccessToken: "at-original", RefreshToken: "rt-original", TokenType: "Bearer",
+		ExpiresAt: &future, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Error)
+
+	// Two "nodes" both read the row with rt-original as the refresh_token and
+	// both redeem it upstream (out of scope here — we're testing only the
+	// store-level CAS), racing to write back their own new credentials.
+	updatedA, err := s.RefreshOauthTokenFieldsIfActive(ctx, "tok-1", "rt-original", "at-node-a", "rt-node-a", &future, time.Now())
+	require.NoError(t, err)
+	assert.True(t, updatedA, "the first writer, whose expectedPriorRefreshToken still matches the stored value, must win")
+
+	// The second writer's redemption is now stale: the row's refresh_token has
+	// already moved to rt-node-a, so its write (still keyed off rt-original)
+	// must be rejected rather than clobbering node A's fresher credentials.
+	updatedB, err := s.RefreshOauthTokenFieldsIfActive(ctx, "tok-1", "rt-original", "at-node-b", "rt-node-b", &future, time.Now())
+	require.NoError(t, err)
+	assert.False(t, updatedB, "a write whose expectedPriorRefreshToken no longer matches the stored value must lose the race")
+
+	stored, err := s.GetOauthTokenByID(ctx, "tok-1")
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, "at-node-a", stored.AccessToken, "the loser's write must not have overwritten the winner's access token")
+	assert.Equal(t, "rt-node-a", stored.RefreshToken, "the loser's write must not have overwritten the winner's refresh token")
+
+	// A write with the now-current refresh_token still succeeds — the CAS
+	// guard rejects stale writers, not every subsequent write.
+	updatedC, err := s.RefreshOauthTokenFieldsIfActive(ctx, "tok-1", "rt-node-a", "at-node-c", "rt-node-c", &future, time.Now())
+	require.NoError(t, err)
+	assert.True(t, updatedC, "a write keyed off the row's actual current refresh_token must succeed")
+}
+
+// TestRefreshOauthTokenFieldsIfActive_StatusGuardStillApplies is a narrow
+// regression check that adding the refresh_token CAS comparison did not
+// regress the pre-existing status guard: a row already flipped to
+// 'needs_reauth' (e.g. by a concurrent RotateMCPOAuthConfig) must still
+// reject the write even when expectedPriorRefreshToken matches exactly.
+func TestRefreshOauthTokenFieldsIfActive_StatusGuardStillApplies(t *testing.T) {
+	s := setupRDBTestStore(t)
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableMCPOauthToken{}))
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+		ID: "tok-2", AuthMode: "shared", OauthConfigID: "cfg-2", Status: "needs_reauth",
+		AccessToken: "at-original", RefreshToken: "rt-original", TokenType: "Bearer",
+		ExpiresAt: &future, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}).Error)
+
+	updated, err := s.RefreshOauthTokenFieldsIfActive(ctx, "tok-2", "rt-original", "at-new", "rt-new", &future, time.Now())
+	require.NoError(t, err)
+	assert.False(t, updated, "a non-'active' row must reject the write even with a matching expectedPriorRefreshToken")
+}
+
+// MarkOauthTokenNeedsReauthIfUnrenewable flips only an active row with no refresh token whose access
+// token has expired, so a reauthorize that landed in between is never overwritten.
+func TestMarkOauthTokenNeedsReauthIfUnrenewable(t *testing.T) {
+	s := setupRDBTestStore(t)
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableMCPOauthToken{}))
+	ctx := context.Background()
+	past, future := time.Now().Add(-time.Minute), time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		id, status, refreshToken string
+		expiresAt                *time.Time
+		wantMarked               bool
+	}{
+		{"expired-no-refresh", "active", "", &past, true},
+		{"expired-with-refresh", "active", "rt-1", &past, false},
+		{"reauthorized-in-between", "active", "", &future, false},
+		{"no-expiry", "active", "", nil, false},
+		{"already-needs-reauth", "needs_reauth", "", &past, false},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+				ID: tc.id, AuthMode: "shared", OauthConfigID: "cfg-" + tc.id, Status: tc.status,
+				AccessToken: "at", RefreshToken: tc.refreshToken, TokenType: "Bearer",
+				ExpiresAt: tc.expiresAt, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+			}).Error)
+			marked, err := s.MarkOauthTokenNeedsReauthIfUnrenewable(ctx, tc.id, "no refresh token")
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMarked, marked)
+			stored, err := s.GetOauthTokenByID(ctx, tc.id)
+			require.NoError(t, err)
+			if tc.wantMarked {
+				assert.Equal(t, "needs_reauth", stored.Status)
+				assert.Equal(t, "no refresh token", stored.StatusReason)
+			} else {
+				assert.Equal(t, tc.status, stored.Status, "a row that can still be used or renewed is left alone")
+			}
+		})
+	}
+}
+
+// The flip deletes the discovery made with the token, as every other needs_reauth flip does: a caller
+// whose token can no longer be used is offered the client's connect tool, not tools that fail.
+func TestMarkOauthTokenNeedsReauthIfUnrenewable_DeletesTheCallersDiscovery(t *testing.T) {
+	s := setupRDBTestStore(t)
+	require.NoError(t, s.DB().AutoMigrate(&tables.TableMCPOauthToken{}))
+	ctx := context.Background()
+	past, future := time.Now().Add(-time.Minute), time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		id, user    string
+		expiresAt   *time.Time
+		wantDeleted bool
+	}{
+		{"expired-no-refresh", "alice", &past, true},
+		{"still-usable", "bob", &future, false},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			user := tc.user
+			require.NoError(t, s.DB().Create(&tables.TableMCPOauthToken{
+				ID: tc.id, AuthMode: string(schemas.MCPAuthModeUser), UserID: &user, MCPClientID: "notes",
+				OauthConfigID: "cfg-" + tc.id, Status: "active", AccessToken: "at", TokenType: "Bearer",
+				ExpiresAt: tc.expiresAt, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+			}).Error)
+			require.NoError(t, s.UpsertMCPPerUserDiscovery(ctx, samplePerUserDiscovery(schemas.MCPAuthModeUser, user, "notes", "search")))
+
+			_, err := s.MarkOauthTokenNeedsReauthIfUnrenewable(ctx, tc.id, "no refresh token")
+			require.NoError(t, err)
+			discovery, err := s.GetMCPPerUserDiscoveryByMode(ctx, schemas.MCPAuthModeUser, user, "notes")
+			require.NoError(t, err)
+			if tc.wantDeleted {
+				assert.Nil(t, discovery, "the discovery goes with the token it was made with")
+			} else {
+				assert.NotNil(t, discovery, "a token left usable keeps its discovery")
+			}
+		})
+	}
+}
+
+// oauth2StoreBackend pairs a backend name with a fresh OAuth2-capable store.
+type oauth2StoreBackend struct {
+	name string
+	s    *RDBConfigStore
+}
+
+// oauth2StoreBackends returns a fresh OAuth2-capable store per available backend.
+// SQLite is always present; Postgres is attached when reachable on the shared
+// test DSN. Postgres matters for column-bound tests specifically: SQLite ignores
+// varchar(n) length, so a bound that silently passes here only surfaces there.
+func oauth2StoreBackends(t *testing.T) []oauth2StoreBackend {
+	t.Helper()
+	backends := []oauth2StoreBackend{{"sqlite", setupOAuth2TestStore(t)}}
+	if pg := trySetupPostgresOAuth2Store(t); pg != nil {
+		backends = append(backends, oauth2StoreBackend{"postgres", pg})
+	}
+	return backends
+}
+
+// trySetupPostgresOAuth2Store builds a Postgres-backed store with the OAuth2
+// issuance tables in their fresh-install shape (created from the current struct
+// tags). Returns nil, without skipping, when Postgres is unreachable.
+func trySetupPostgresOAuth2Store(t *testing.T) *RDBConfigStore {
+	t.Helper()
+	db, err := gorm.Open(postgres.Open(postgresDSN), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	if err != nil {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil || sqlDB.Ping() != nil {
+		return nil
+	}
+	if db.Exec("CREATE SCHEMA IF NOT EXISTS "+pgTestSchema).Error != nil {
+		return nil
+	}
+	dropOAuth2Tables := func() {
+		db.Exec("DROP TABLE IF EXISTS oauth2_refresh_tokens CASCADE")
+		db.Exec("DROP TABLE IF EXISTS oauth2_authorize_requests CASCADE")
+		db.Exec("DROP TABLE IF EXISTS oauth2_clients CASCADE")
+	}
+	dropOAuth2Tables()
+	require.NoError(t, db.AutoMigrate(
+		&tables.TableOAuth2Client{},
+		&tables.TableOAuth2AuthorizeRequest{},
+		&tables.TableOAuth2RefreshToken{},
+	))
+	t.Cleanup(dropOAuth2Tables)
+
+	s := &RDBConfigStore{logger: nil}
+	s.db.Store(db)
+	s.migrateOnFreshFn = func(ctx context.Context, fn func(context.Context, *gorm.DB) error) error {
+		return fn(ctx, s.DB())
+	}
+	s.refreshPoolFn = func(ctx context.Context) error { return nil }
+	return s
+}
+
+// TestCreateOAuth2AuthorizeRequest_LongStateRoundTrips pins that the state
+// parameter is stored verbatim whatever its length. RFC 6749 §4.1.1 puts no
+// bound on state, and OAuth clients pack connector context into it (a 620-char
+// base64 JSON blob in the reported case). The column was varchar(512), which
+// Postgres enforces and SQLite ignores, so a too-long state surfaced only in
+// production as an opaque server_error at /oauth2/authorize.
+func TestCreateOAuth2AuthorizeRequest_LongStateRoundTrips(t *testing.T) {
+	for _, b := range oauth2StoreBackends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			state := strings.Repeat("s", 4096)
+			req := &tables.TableOAuth2AuthorizeRequest{
+				ID:                  "long-state",
+				ClientID:            "client-1",
+				RedirectURI:         "https://client.example/cb",
+				State:               state,
+				Scope:               "mcp",
+				Resource:            "https://bifrost.test/mcp",
+				CodeChallenge:       "challenge",
+				CodeChallengeMethod: "S256",
+				Status:              tables.OAuth2AuthorizeRequestStatusPending,
+				ExpiresAt:           now.Add(time.Minute),
+				CreatedAt:           now,
+				UpdatedAt:           now,
+			}
+			require.NoError(t, b.s.CreateOAuth2AuthorizeRequest(ctx, req))
+
+			got, err := b.s.GetOAuth2AuthorizeRequestByID(ctx, "long-state")
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, state, got.State)
+
+			// The column itself must be text, so the fresh-install schema and the
+			// widened upgrade schema agree.
+			assertTextColumn(t, b.s.DB(), &tables.TableOAuth2AuthorizeRequest{}, "state")
+		})
+	}
+}
+
+// TestOAuth2ClientControlledFields_LongValuesRoundTrip pins that the other
+// client-controlled AS fields are stored verbatim whatever their length. RFC 7591
+// §2 (client_name, scope at registration) and RFC 6749 §3.3 (scope at authorize)
+// put no bound on them, and the registered scope flows unchanged into the
+// authorize request and the refresh token. These columns were varchar(255),
+// which Postgres enforces and SQLite ignores.
+func TestOAuth2ClientControlledFields_LongValuesRoundTrip(t *testing.T) {
+	for _, b := range oauth2StoreBackends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			longName := strings.Repeat("n", 1024)
+			longScope := "mcp " + strings.Repeat("read:x ", 200)
+
+			client := &tables.TableOAuth2Client{
+				ID:           "client-row-long",
+				ClientID:     "client-long",
+				ClientName:   longName,
+				RedirectURIs: []string{"https://client.example/cb"},
+				GrantTypes:   []string{"authorization_code"},
+				Scope:        longScope,
+				CreatedAt:    now,
+			}
+			require.NoError(t, b.s.CreateOAuth2Client(ctx, client))
+			gotClient, err := b.s.GetOAuth2ClientByClientID(ctx, "client-long")
+			require.NoError(t, err)
+			assert.Equal(t, longName, gotClient.ClientName)
+			assert.Equal(t, longScope, gotClient.Scope)
+
+			req := &tables.TableOAuth2AuthorizeRequest{
+				ID:                  "req-long-scope",
+				ClientID:            "client-long",
+				RedirectURI:         "https://client.example/cb",
+				State:               "state",
+				Scope:               longScope,
+				Resource:            "https://bifrost.test/mcp",
+				CodeChallenge:       "challenge",
+				CodeChallengeMethod: "S256",
+				Status:              tables.OAuth2AuthorizeRequestStatusConsented,
+				CodeHash:            strPtr("code-hash-long"),
+				ExpiresAt:           now.Add(time.Minute),
+				CreatedAt:           now,
+				UpdatedAt:           now,
+			}
+			require.NoError(t, b.s.CreateOAuth2AuthorizeRequest(ctx, req))
+			gotReq, err := b.s.GetOAuth2AuthorizeRequestByID(ctx, "req-long-scope")
+			require.NoError(t, err)
+			assert.Equal(t, longScope, gotReq.Scope)
+
+			rt := makeRefreshToken("rt-long", "req-long-scope", "client-long", "hash-long")
+			rt.Scope = longScope
+			require.NoError(t, b.s.ConsumeOAuth2AuthorizeRequest(ctx, "req-long-scope", rt))
+			gotRT, err := b.s.GetOAuth2RefreshTokenByHash(ctx, "hash-long")
+			require.NoError(t, err)
+			assert.Equal(t, longScope, gotRT.Scope)
+
+			assertTextColumn(t, b.s.DB(), &tables.TableOAuth2Client{}, "client_name")
+			assertTextColumn(t, b.s.DB(), &tables.TableOAuth2Client{}, "scope")
+			assertTextColumn(t, b.s.DB(), &tables.TableOAuth2AuthorizeRequest{}, "scope")
+			assertTextColumn(t, b.s.DB(), &tables.TableOAuth2RefreshToken{}, "scope")
+		})
+	}
+}
+
+// assertTextColumn checks that the named column of model is declared text on
+// whatever backend db is. It compares the type name rather than Length(): the
+// postgres driver reports MaxInt64 for text, not "no bound".
+func assertTextColumn(t *testing.T, db *gorm.DB, model any, column string) {
+	t.Helper()
+	cols, err := db.Migrator().ColumnTypes(model)
+	require.NoError(t, err)
+	for _, c := range cols {
+		if c.Name() != column {
+			continue
+		}
+		assert.Truef(t, strings.EqualFold(c.DatabaseTypeName(), "text"),
+			"%s column type is %q; want text", column, c.DatabaseTypeName())
+		return
+	}
+	t.Errorf("%s column not found", column)
 }

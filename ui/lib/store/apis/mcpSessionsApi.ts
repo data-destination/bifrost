@@ -5,6 +5,7 @@ import {
 	MCPFlowDetail,
 	MCPFlowStartResponse,
 	MCPSessionReauthResponse,
+	MCPSessionRefreshResponse,
 	MCPSessionsListResponse,
 	MCPSessionsQueryParams,
 } from "@/lib/types/mcpSessions";
@@ -24,6 +25,8 @@ function buildMCPSessionsListParams(params?: MCPSessionsQueryParams) {
 	if (params.status?.length) out.status = [...params.status].sort().join(",");
 	if (params.auth_mode?.length) out.auth_mode = [...params.auth_mode].sort().join(",");
 	if (params.mcp_client_id?.length) out.mcp_client_id = [...params.mcp_client_id].sort().join(",");
+	if (params.virtual_key_id?.length) out.virtual_key_id = [...params.virtual_key_id].sort().join(",");
+	if (params.user_id?.length) out.user_id = [...params.user_id].sort().join(",");
 	if (params.limit !== undefined) out.limit = params.limit;
 	if (params.offset !== undefined) out.offset = params.offset;
 	return out;
@@ -51,6 +54,13 @@ export const mcpSessionsApi = baseApi.injectEndpoints({
 		// after the user comes back picks up whatever state landed.
 		reauthMCPSession: builder.mutation<MCPSessionReauthResponse, string>({
 			query: (rowId) => ({ url: `/mcp/sessions/${rowId}/reauth`, method: "POST" }),
+		}),
+
+		// Discovers the row's caller's tools again with its stored credential. The
+		// row's discovery counts change, so every keyed list entry refetches.
+		refreshMCPSession: builder.mutation<MCPSessionRefreshResponse, string>({
+			query: (rowId) => ({ url: `/mcp/sessions/${rowId}/refresh`, method: "POST" }),
+			invalidatesTags: ["MCPSessions"],
 		}),
 
 		// Best-effort upstream revoke + hard-delete the row. Invalidates the
@@ -84,6 +94,7 @@ export const mcpSessionsApi = baseApi.injectEndpoints({
 export const {
 	useGetMCPSessionsQuery,
 	useReauthMCPSessionMutation,
+	useRefreshMCPSessionMutation,
 	useRevokeMCPSessionMutation,
 	useGetMCPFlowDetailQuery,
 	useStartMCPFlowMutation,

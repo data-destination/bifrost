@@ -9,6 +9,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -247,6 +249,67 @@ func TestTranscription_VerboseJSON_StillWorks(t *testing.T) {
 	}
 }
 
+// runTranscriptionAgainstBody sends a transcription request with the given
+// response_format to a stub that answers 200 with body.
+func runTranscriptionAgainstBody(t *testing.T, responseFormat, body string) (*schemas.BifrostTranscriptionResponse, *schemas.BifrostError) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+
+	provider := NewOpenAIProvider(&schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{
+			BaseURL:                        server.URL,
+			DefaultRequestTimeoutInSeconds: 30,
+		},
+	}, &testLogger{})
+
+	request := &schemas.BifrostTranscriptionRequest{
+		Model: "whisper-1",
+		Input: &schemas.TranscriptionInput{
+			File:     []byte("fake-audio-bytes"),
+			Filename: "noise.wav",
+		},
+		Params: &schemas.TranscriptionParameters{
+			ResponseFormat: &responseFormat,
+		},
+	}
+
+	ctx, cancel := schemas.NewBifrostContextWithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return provider.Transcription(ctx, schemas.Key{Value: *schemas.NewSecretVar("test-key")}, request)
+}
+
+// Audio with no speech (white noise, music, silence) makes OpenAI answer a
+// plain-text format with 200 and an empty or whitespace-only body. That is a
+// valid empty transcript, not a provider failure.
+func TestTranscription_PlainTextFormats_EmptyTranscriptIsNotAnError(t *testing.T) {
+	for _, format := range []string{"text", "srt", "vtt"} {
+		for _, body := range []string{"", "\n"} {
+			t.Run(format+"/"+strconv.Quote(body), func(t *testing.T) {
+				resp, bifrostErr := runTranscriptionAgainstBody(t, format, body)
+				if bifrostErr != nil {
+					t.Fatalf("expected an empty transcript, got error: %s", bifrostErr.Error.Message)
+				}
+				if resp == nil || strings.TrimSpace(resp.Text) != "" {
+					t.Fatalf("expected empty text, got %+v", resp)
+				}
+			})
+		}
+	}
+}
+
+// A JSON format still needs a body to decode, so an empty one stays an error.
+func TestTranscription_JSONFormat_EmptyBodyIsStillAnError(t *testing.T) {
+	_, bifrostErr := runTranscriptionAgainstBody(t, "json", "")
+	if bifrostErr == nil || bifrostErr.Error == nil || bifrostErr.Error.Message != schemas.ErrProviderResponseEmpty {
+		t.Fatalf("expected %q, got %+v", schemas.ErrProviderResponseEmpty, bifrostErr)
+	}
+}
+
 func multipartPartOrder(t *testing.T, contentType string, body []byte) []string {
 	t.Helper()
 	_, params, err := mime.ParseMediaType(contentType)
@@ -340,6 +403,67 @@ func multipartFieldValue(t *testing.T, contentType string, body []byte, name str
 		}
 		_, _ = io.Copy(io.Discard, part)
 		_ = part.Close()
+	}
+	return ""
+}
+
+// TestTranscriptionRequest_PreservesFilenameEndToEnd covers issue #5670: the
+// ingress conversion must carry the client's filename into the Bifrost request
+// so the outbound multipart form labels the audio with its real container.
+// M4A/MP4/webm bytes are not magic-byte sniffable, so a dropped filename hits
+// the audio.mp3 fallback and OpenAI rejects the mislabelled upload.
+func TestTranscriptionRequest_PreservesFilenameEndToEnd(t *testing.T) {
+	ingress := &OpenAITranscriptionRequest{
+		Model:    "whisper-1",
+		File:     []byte("\x00\x00\x00\x20ftypM4A fake-m4a-bytes"),
+		Filename: "recording.m4a",
+	}
+
+	bifrostReq := ingress.ToBifrostTranscriptionRequest(nil)
+	if bifrostReq.Input.Filename != "recording.m4a" {
+		t.Fatalf("ingress conversion dropped filename: %q", bifrostReq.Input.Filename)
+	}
+
+	egress := ToOpenAITranscriptionRequest(bifrostReq)
+	if egress == nil {
+		t.Fatal("egress request is nil")
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if bifrostErr := ParseTranscriptionFormDataBodyFromRequest(writer, egress, schemas.OpenAI); bifrostErr != nil {
+		t.Fatalf("unexpected bifrost error: %v", bifrostErr.Error.Message)
+	}
+
+	if got := multipartFilePartName(t, writer.FormDataContentType(), body.Bytes()); got != "recording.m4a" {
+		t.Errorf("wire multipart file part named %q, want %q (sniffing fallback engaged)", got, "recording.m4a")
+	}
+}
+
+// multipartFilePartName returns the filename of the first "file" part in the
+// multipart body, or "" if absent.
+func multipartFilePartName(t *testing.T, contentType string, body []byte) string {
+	t.Helper()
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatalf("ParseMediaType(%q): %v", contentType, err)
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("NextPart(): %v", err)
+		}
+		name := part.FormName()
+		filename := part.FileName()
+		_, _ = io.Copy(io.Discard, part)
+		_ = part.Close()
+		if name == "file" {
+			return filename
+		}
 	}
 	return ""
 }

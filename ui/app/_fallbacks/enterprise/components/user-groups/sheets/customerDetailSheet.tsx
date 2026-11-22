@@ -1,9 +1,11 @@
+import { CopyableId } from "@/components/copyableId";
 import { Label } from "@/components/ui/label";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
-import { resetDurationLabels } from "@/lib/constants/governance";
+import { fiscalQuarterNote, resetDurationLabels } from "@/lib/constants/governance";
 import { Customer } from "@/lib/types/governance";
 import { cn } from "@/lib/utils";
 import { formatCompactNumber } from "@/lib/utils/numbers";
+import { useTranslation } from "react-i18next";
 
 interface Props {
 	customer: Customer | null;
@@ -31,7 +33,17 @@ function DetailCard({ title, children, contentClassName }: { title: string; chil
 	);
 }
 
-function BudgetLineBar({ current, max, resetDuration }: { current: number; max: number; resetDuration?: string }) {
+function BudgetLineBar({
+	current,
+	max,
+	resetDuration,
+	resetConfig,
+}: {
+	current: number;
+	max: number;
+	resetDuration?: string;
+	resetConfig?: { quarter_start_month?: number };
+}) {
 	const pct = max > 0 ? Math.min((current / max) * 100, 100) : 0;
 	const isOver80 = pct >= 80;
 	const isOver100 = pct >= 100;
@@ -39,7 +51,10 @@ function BudgetLineBar({ current, max, resetDuration }: { current: number; max: 
 		<div className="space-y-1.5">
 			<div className="flex items-center justify-between text-xs">
 				<span className="font-medium" />
-				<span className="text-muted-foreground">{formatResetDuration(resetDuration)}</span>
+				<span className="text-muted-foreground">
+					{formatResetDuration(resetDuration)}
+					{fiscalQuarterNote(resetDuration, resetConfig)}
+				</span>
 			</div>
 			<div className="bg-muted h-1.5 w-full overflow-hidden rounded-full">
 				<div
@@ -89,6 +104,8 @@ function RateLimitBar({ label, current, max, resetDuration }: { label: string; c
 // the Teams / Business Units sections, which depend on enterprise-only APIs.
 
 export function CustomerDetailSheet({ customer, open, onOpenChange }: Props) {
+	const { t } = useTranslation("governance");
+	const { t: tModels } = useTranslation("models");
 	const budgets = customer?.budgets ?? [];
 	const rateLimit = customer?.rate_limit;
 	const hasRateLimit = rateLimit?.token_max_limit != null || rateLimit?.request_max_limit != null;
@@ -96,45 +113,54 @@ export function CustomerDetailSheet({ customer, open, onOpenChange }: Props) {
 	return (
 		<Sheet open={open} onOpenChange={onOpenChange}>
 			<SheetContent className="max-w-[700px] overflow-y-auto p-0 pt-4">
-				<SheetHeader className="flex flex-col items-start px-0 py-4" headerClassName="mb-0 px-8 sticky -top-4 bg-card z-10">
-					<SheetTitle className="text-lg">{customer?.name || "Customer Details"}</SheetTitle>
-					<SheetDescription>Usage details for this customer.</SheetDescription>
+				<SheetHeader className="flex flex-col items-start px-0 py-4" headerClassName="mb-0 px-4 md:px-8 sticky -top-4 bg-card z-10">
+					<div className="flex min-w-0 items-center gap-1">
+						<SheetTitle className="truncate text-lg">{customer?.name || t("customers.detail.title")}</SheetTitle>
+						{customer?.id && <CopyableId id={customer.id} entityLabel="Customer" />}
+					</div>
+					<SheetDescription>{t("customers.detail.description")}</SheetDescription>
 				</SheetHeader>
 
 				{customer && (
-					<div className="space-y-6 px-8 py-4">
+					<div className="space-y-6 px-4 py-4 md:px-8">
 						{/* ── Info ─────────────────────────────────────────── */}
-						<DetailCard title="Info">
+						<DetailCard title={t("customers.detail.info")}>
 							<div className="grid grid-cols-2 gap-x-8 gap-y-4">
 								<div>
-									<Label className="text-muted-foreground text-xs">Name</Label>
+									<Label className="text-muted-foreground text-xs">{t("customers.detail.name")}</Label>
 									<p className="mt-0.5 text-sm">{customer.name ?? "—"}</p>
 								</div>
 							</div>
 						</DetailCard>
 
 						{/* ── Budgets ──────────────────────────────────────── */}
-						<DetailCard title="Budgets">
+						<DetailCard title={t("sheet.budgets")}>
 							{budgets.length > 0 ? (
 								<div className="space-y-3">
 									{[...budgets]
 										.sort((a, b) => (b.max_limit || 0) - (a.max_limit || 0))
 										.map((b) => (
-											<BudgetLineBar key={b.id} current={b.current_usage} max={b.max_limit} resetDuration={b.reset_duration} />
+											<BudgetLineBar
+												key={b.id}
+												current={b.current_usage}
+												max={b.max_limit}
+												resetDuration={b.reset_duration}
+												resetConfig={b.reset_config}
+											/>
 										))}
 								</div>
 							) : (
-								<p className="text-muted-foreground py-1 text-center text-sm">No budgets configured</p>
+								<p className="text-muted-foreground py-1 text-center text-sm">{t("customers.detail.noBudgets")}</p>
 							)}
 						</DetailCard>
 
 						{/* ── Rate Limits ──────────────────────────────────── */}
-						<DetailCard title="Rate Limits">
+						<DetailCard title={tModels("virtualKeys.rateLimits")}>
 							{rateLimit && hasRateLimit ? (
 								<div className="space-y-3">
 									{rateLimit.token_max_limit != null && (
 										<RateLimitBar
-											label="Tokens"
+											label={t("sheet.tokens")}
 											current={rateLimit.token_current_usage ?? 0}
 											max={rateLimit.token_max_limit}
 											resetDuration={rateLimit.token_reset_duration}
@@ -142,7 +168,7 @@ export function CustomerDetailSheet({ customer, open, onOpenChange }: Props) {
 									)}
 									{rateLimit.request_max_limit != null && (
 										<RateLimitBar
-											label="Requests"
+											label={t("sheet.requests")}
 											current={rateLimit.request_current_usage ?? 0}
 											max={rateLimit.request_max_limit}
 											resetDuration={rateLimit.request_reset_duration}
@@ -150,7 +176,7 @@ export function CustomerDetailSheet({ customer, open, onOpenChange }: Props) {
 									)}
 								</div>
 							) : (
-								<p className="text-muted-foreground py-1 text-center text-sm">No rate limits configured</p>
+								<p className="text-muted-foreground py-1 text-center text-sm">{tModels("virtualKeys.noRateLimits")}</p>
 							)}
 						</DetailCard>
 					</div>

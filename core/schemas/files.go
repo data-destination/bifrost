@@ -45,6 +45,8 @@ type FileObject struct {
 	CreatedAt     int64       `json:"created_at"`
 	UpdatedAt     int64       `json:"updated_at,omitempty"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`
@@ -58,6 +60,7 @@ type BifrostFileUploadRequest struct {
 
 	// File content
 	File        []byte      `json:"-"`                      // Raw file content (not serialized)
+	FileSource  BodySource  `json:"-"`                      // File as a handle (HTTP uploads), used instead of File; see FileSourceUploader
 	Filename    string      `json:"filename"`               // Original filename
 	Purpose     FilePurpose `json:"purpose"`                // Purpose of the file (e.g., "batch")
 	ContentType *string     `json:"content_type,omitempty"` // MIME type of the file
@@ -105,6 +108,8 @@ type BifrostFileUploadResponse struct {
 	Bytes         int64       `json:"bytes"`
 	CreatedAt     int64       `json:"created_at"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`
@@ -187,6 +192,8 @@ type BifrostFileRetrieveResponse struct {
 	CreatedAt     int64       `json:"created_at"`
 	UpdatedAt     int64       `json:"updated_at,omitempty"`
 	Filename      string      `json:"filename"`
+	ContentType   string      `json:"content_type,omitempty"` // MIME type reported by the provider
+	Downloadable  *bool       `json:"downloadable,omitempty"` // Nil when the provider does not report downloadability
 	Purpose       FilePurpose `json:"purpose"`
 	Status        FileStatus  `json:"status,omitempty"`
 	StatusDetails *string     `json:"status_details,omitempty"`

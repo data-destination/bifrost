@@ -14,21 +14,21 @@ import (
 
 // CohereResponsesStreamState tracks state during streaming conversion for responses API
 type CohereResponsesStreamState struct {
-	ContentIndexToOutputIndex     map[int]int    // Maps Cohere content_index to OpenAI output_index
-	ToolArgumentBuffers           map[int]string // Maps output_index to accumulated tool argument JSON
-	ToolCallNames                 map[int]string // Maps output_index to tool name
-	ItemIDs                       map[int]string // Maps output_index to item ID for stable IDs
-	ReasoningContentIndices       map[int]bool   // Tracks which content indices are reasoning blocks
-	AnnotationIndexToContentIndex map[int]int    // Maps annotation index to content index for citation pairing
-	TextBuffers                   map[int]*strings.Builder // Maps output_index to accumulated text content for done events
-	CurrentOutputIndex            int            // Current output index counter
-	MessageID                     *string        // Message ID from message_start
-	Model                         *string        // Model name from message_start
-	CreatedAt                     int            // Timestamp for created_at consistency
-	HasEmittedCreated             bool           // Whether we've emitted response.created
-	HasEmittedInProgress          bool           // Whether we've emitted response.in_progress
-	ToolPlanOutputIndex           *int           // Output index for tool plan text item (if created)
-	OutputItems                   map[int]*schemas.ResponsesMessage // Maps output_index to accumulated output item for response.completed
+	ContentIndexToOutputIndex     map[int]int                                                   // Maps Cohere content_index to OpenAI output_index
+	ToolArgumentBuffers           map[int]string                                                // Maps output_index to accumulated tool argument JSON
+	ToolCallNames                 map[int]string                                                // Maps output_index to tool name
+	ItemIDs                       map[int]string                                                // Maps output_index to item ID for stable IDs
+	ReasoningContentIndices       map[int]bool                                                  // Tracks which content indices are reasoning blocks
+	AnnotationIndexToContentIndex map[int]int                                                   // Maps annotation index to content index for citation pairing
+	TextBuffers                   map[int]*strings.Builder                                      // Maps output_index to accumulated text content for done events
+	CurrentOutputIndex            int                                                           // Current output index counter
+	MessageID                     *string                                                       // Message ID from message_start
+	Model                         *string                                                       // Model name from message_start
+	CreatedAt                     int                                                           // Timestamp for created_at consistency
+	HasEmittedCreated             bool                                                          // Whether we've emitted response.created
+	HasEmittedInProgress          bool                                                          // Whether we've emitted response.in_progress
+	ToolPlanOutputIndex           *int                                                          // Output index for tool plan text item (if created)
+	OutputItems                   map[int]*schemas.ResponsesMessage                             // Maps output_index to accumulated output item for response.completed
 	AnnotationsByOutputIndex      map[int][]schemas.ResponsesOutputMessageContentTextAnnotation // Maps output_index to citation annotations for done events and response.completed
 }
 
@@ -471,7 +471,7 @@ func (chunk *CohereStreamEvent) ToBifrostResponsesStream(sequenceNumber int, sta
 				role := schemas.ResponsesInputMessageRoleAssistant
 
 				// Generate stable ID for reasoning item
-				itemID := "rs_" + providerUtils.GetRandomString(50)
+				itemID := "rs_" + schemas.GetRandomString(50)
 				state.ItemIDs[outputIndex] = itemID
 
 				item := &schemas.ResponsesMessage{
@@ -1274,7 +1274,7 @@ func ToCohereResponsesRequest(bifrostReq *schemas.BifrostResponsesRequest) (*Coh
 				cohereReq.Thinking = thinking
 			} else {
 				if bifrostReq.Params.Reasoning.Effort != nil && *bifrostReq.Params.Reasoning.Effort != "none" {
-					maxOutputTokens := providerUtils.GetMaxOutputTokensOrDefault(bifrostReq.Model, DefaultCompletionMaxTokens)
+					maxOutputTokens := providerUtils.GetMaxOutputTokensOrDefault(bifrostReq.Provider, bifrostReq.Model, DefaultCompletionMaxTokens)
 					if bifrostReq.Params.MaxOutputTokens != nil {
 						maxOutputTokens = *bifrostReq.Params.MaxOutputTokens
 					}
@@ -1437,6 +1437,21 @@ func ConvertBifrostMessagesToCohereMessages(bifrostMessages []schemas.ResponsesM
 	var pendingReasoningContentBlocks []CohereContentBlock
 	var currentAssistantMessage *CohereMessage
 
+	// flushAssistant emits the assistant turn being assembled, with any pending
+	// thinking placed ahead of its other content (Cohere rejects thinking that
+	// follows a text block).
+	flushAssistant := func() {
+		if currentAssistantMessage == nil {
+			return
+		}
+		if len(pendingReasoningContentBlocks) > 0 {
+			prependCohereThinking(currentAssistantMessage, pendingReasoningContentBlocks)
+			pendingReasoningContentBlocks = nil
+		}
+		cohereMessages = append(cohereMessages, *currentAssistantMessage)
+		currentAssistantMessage = nil
+	}
+
 	for _, msg := range bifrostMessages {
 		// Handle nil Type with default
 		msgType := schemas.ResponsesMessageTypeMessage
@@ -1462,42 +1477,19 @@ func ConvertBifrostMessagesToCohereMessages(bifrostMessages []schemas.ResponsesM
 				cohereMsg := convertBifrostMessageToCohereMessage(&msg)
 				if cohereMsg != nil {
 					if role == "assistant" {
-						// Add any pending reasoning content blocks to the message
-						if len(pendingReasoningContentBlocks) > 0 {
-							// copy the pending reasoning content blocks
-							copied := make([]CohereContentBlock, len(pendingReasoningContentBlocks))
-							copy(copied, pendingReasoningContentBlocks)
-							contentBlocks := copied
-							pendingReasoningContentBlocks = nil
-							// Add content blocks after pending reasoning content blocks are added
-							if msg.Content != nil {
-								if msg.Content.ContentStr != nil {
-									contentBlocks = append(contentBlocks, CohereContentBlock{
-										Type: CohereContentBlockTypeText,
-										Text: msg.Content.ContentStr,
-									})
-								} else if msg.Content.ContentBlocks != nil {
-									contentBlocks = append(contentBlocks, convertResponsesMessageContentBlocksToCohere(msg.Content.ContentBlocks)...)
-								}
-							}
-							cohereMsg.Content = NewBlocksContent(contentBlocks)
+						// Text after a finished assistant turn starts a new one; text after
+						// pending reasoning joins it.
+						if currentAssistantMessage != nil && cohereMessageHasNonThinkingContent(currentAssistantMessage) {
+							flushAssistant()
 						}
-						// Store assistant message for potential reasoning blocks
+						if len(pendingReasoningContentBlocks) > 0 {
+							prependCohereThinking(cohereMsg, pendingReasoningContentBlocks)
+							pendingReasoningContentBlocks = nil
+						}
+						// Store assistant message for potential reasoning blocks and tool calls
 						currentAssistantMessage = cohereMsg
 					} else {
-						// Flush any pending assistant message first for non-assistant messages
-						if currentAssistantMessage != nil {
-							if len(pendingReasoningContentBlocks) > 0 {
-								if currentAssistantMessage.Content == nil {
-									currentAssistantMessage.Content = NewBlocksContent(pendingReasoningContentBlocks)
-								} else if currentAssistantMessage.Content.BlocksContent != nil {
-									currentAssistantMessage.Content.BlocksContent = append(currentAssistantMessage.Content.BlocksContent, pendingReasoningContentBlocks...)
-								}
-								pendingReasoningContentBlocks = nil
-							}
-							cohereMessages = append(cohereMessages, *currentAssistantMessage)
-							currentAssistantMessage = nil
-						}
+						flushAssistant()
 						cohereMessages = append(cohereMessages, *cohereMsg)
 					}
 				}
@@ -1507,6 +1499,13 @@ func ConvertBifrostMessagesToCohereMessages(bifrostMessages []schemas.ResponsesM
 			// Handle reasoning as thinking content blocks
 			reasoningBlocks := convertBifrostReasoningToCohereThinking(&msg)
 			if len(reasoningBlocks) > 0 {
+				// Cohere requires thinking blocks to precede every other block in a
+				// message, so reasoning that follows an assistant turn which already
+				// carries text or tool calls opens a new assistant turn instead of
+				// trailing it.
+				if currentAssistantMessage != nil && cohereMessageHasNonThinkingContent(currentAssistantMessage) {
+					flushAssistant()
+				}
 				if currentAssistantMessage == nil {
 					currentAssistantMessage = &CohereMessage{
 						Role: "assistant",
@@ -1516,47 +1515,38 @@ func ConvertBifrostMessagesToCohereMessages(bifrostMessages []schemas.ResponsesM
 			}
 
 		case schemas.ResponsesMessageTypeFunctionCall:
-			// Flush any pending reasoning blocks first
-			if len(pendingReasoningContentBlocks) > 0 && currentAssistantMessage != nil {
-				if currentAssistantMessage.Content == nil {
-					currentAssistantMessage.Content = NewBlocksContent(pendingReasoningContentBlocks)
-				} else if currentAssistantMessage.Content.BlocksContent != nil {
-					currentAssistantMessage.Content.BlocksContent = append(currentAssistantMessage.Content.BlocksContent, pendingReasoningContentBlocks...)
-				}
-				cohereMessages = append(cohereMessages, *currentAssistantMessage)
-				pendingReasoningContentBlocks = nil
-				currentAssistantMessage = nil
-			}
-
-			// Handle function calls from Responses
+			// Cohere returns a reasoning/tool turn as ONE assistant message (thinking
+			// and any text in content, the calls in tool_calls), which ingress splits
+			// into reasoning, message and function_call items; fold them back so the
+			// replayed turn has the shape Cohere produced.
 			assistantMsg := convertBifrostFunctionCallToCohereMessage(&msg)
 			if assistantMsg != nil {
-				cohereMessages = append(cohereMessages, *assistantMsg)
+				if currentAssistantMessage == nil {
+					currentAssistantMessage = assistantMsg
+				} else {
+					currentAssistantMessage.ToolCalls = append(currentAssistantMessage.ToolCalls, assistantMsg.ToolCalls...)
+				}
 			}
 
 		case schemas.ResponsesMessageTypeFunctionCallOutput:
 			// Handle function call outputs
 			toolMsg := convertBifrostFunctionCallOutputToCohereMessage(&msg)
 			if toolMsg != nil {
+				flushAssistant()
 				cohereMessages = append(cohereMessages, *toolMsg)
 			}
 		}
 	}
 
-	// Flush any remaining pending reasoning blocks
-	if len(pendingReasoningContentBlocks) > 0 && currentAssistantMessage != nil {
-		if currentAssistantMessage.Content == nil {
-			currentAssistantMessage.Content = NewBlocksContent(pendingReasoningContentBlocks)
-		} else if currentAssistantMessage.Content.BlocksContent != nil {
-			currentAssistantMessage.Content.BlocksContent = append(currentAssistantMessage.Content.BlocksContent, pendingReasoningContentBlocks...)
-		}
-		cohereMessages = append(cohereMessages, *currentAssistantMessage)
-	} else if currentAssistantMessage != nil {
-		cohereMessages = append(cohereMessages, *currentAssistantMessage)
-	}
+	// Flush the assistant turn still being assembled
+	flushAssistant()
 
 	// Prepend system messages if any
 	if len(systemContent) > 0 {
+		// Instructions lead the system prompt, ahead of any system/developer input (OpenAI semantics)
+		if params != nil && params.Instructions != nil && *params.Instructions != "" {
+			systemContent = append([]string{*params.Instructions}, systemContent...)
+		}
 		systemMsg := CohereMessage{
 			Role:    "system",
 			Content: NewStringContent(strings.Join(systemContent, "\n")),
@@ -1632,6 +1622,40 @@ func convertBifrostMessageToCohereSystemContent(msg *schemas.ResponsesMessage) [
 	return systemContent
 }
 
+// cohereMessageHasNonThinkingContent reports whether msg carries anything other than thinking blocks.
+func cohereMessageHasNonThinkingContent(msg *CohereMessage) bool {
+	if len(msg.ToolCalls) > 0 {
+		return true
+	}
+	if msg.Content == nil {
+		return false
+	}
+	if msg.Content.StringContent != nil {
+		return true
+	}
+	for _, block := range msg.Content.BlocksContent {
+		if block.Type != CohereContentBlockTypeThinking {
+			return true
+		}
+	}
+	return false
+}
+
+// prependCohereThinking places thinking ahead of msg's existing content, the
+// only order Cohere accepts within one message.
+func prependCohereThinking(msg *CohereMessage, thinking []CohereContentBlock) {
+	blocks := make([]CohereContentBlock, 0, len(thinking)+1)
+	blocks = append(blocks, thinking...)
+	if msg.Content != nil {
+		if msg.Content.StringContent != nil {
+			blocks = append(blocks, CohereContentBlock{Type: CohereContentBlockTypeText, Text: msg.Content.StringContent})
+		} else {
+			blocks = append(blocks, msg.Content.BlocksContent...)
+		}
+	}
+	msg.Content = NewBlocksContent(blocks)
+}
+
 // convertBifrostMessageToCohereMessage converts a regular Bifrost message to Cohere message
 func convertBifrostMessageToCohereMessage(msg *schemas.ResponsesMessage) *CohereMessage {
 	role := "user"
@@ -1660,38 +1684,99 @@ func convertBifrostMessageToCohereMessage(msg *schemas.ResponsesMessage) *Cohere
 func convertBifrostReasoningToCohereThinking(msg *schemas.ResponsesMessage) []CohereContentBlock {
 	var thinkingBlocks []CohereContentBlock
 
-	if msg.Content != nil && msg.Content.ContentBlocks != nil {
+	// Track whether the content blocks actually yielded reasoning rather than
+	// branching on Content being non-nil. A non-nil but EMPTY ContentBlocks -- or
+	// one carrying only non-reasoning blocks -- must fall through to
+	// ResponsesReasoning instead of shadowing it, otherwise the replayed
+	// reasoning is dropped with no error and no warning.
+	emittedFromContentBlocks := false
+	if msg.Content != nil {
 		for _, block := range msg.Content.ContentBlocks {
 			if block.Type == schemas.ResponsesOutputMessageContentTypeReasoning && block.Text != nil {
-				thinkingBlock := CohereContentBlock{
+				thinkingBlocks = append(thinkingBlocks, CohereContentBlock{
 					Type:     CohereContentBlockTypeThinking,
 					Thinking: block.Text,
-				}
-				thinkingBlocks = append(thinkingBlocks, thinkingBlock)
+				})
+				emittedFromContentBlocks = true
 			}
 		}
-	} else if msg.ResponsesReasoning != nil {
-		if msg.ResponsesReasoning.Summary != nil {
-			for _, reasoningContent := range msg.ResponsesReasoning.Summary {
-				thinkingBlock := CohereContentBlock{
-					Type:     CohereContentBlockTypeThinking,
-					Thinking: &reasoningContent.Text,
-				}
-				thinkingBlocks = append(thinkingBlocks, thinkingBlock)
-			}
-		} else if msg.ResponsesReasoning.EncryptedContent != nil {
-			// Cohere doesn't have a direct equivalent to encrypted content,
-			// so we'll store it as a regular thinking block with a special marker
-			encryptedText := fmt.Sprintf("[ENCRYPTED_REASONING: %s]", *msg.ResponsesReasoning.EncryptedContent)
-			thinkingBlock := CohereContentBlock{
+	}
+	if msg.ResponsesReasoning == nil {
+		return thinkingBlocks
+	}
+
+	// Not `emittedFromContentBlocks || ...`: the content blocks and the encrypted
+	// token are independent facts, and a message can carry both. This file's own
+	// ingress path produces exactly that shape - restoring EncryptedContent
+	// leaves the visible reasoning blocks in place - so returning early here
+	// dropped the token on the next turn, which is the turn it exists for.
+	//
+	// Only the SUMMARY is skipped when the content blocks already spoke, since
+	// those two carry the same visible text and emitting both would duplicate it.
+
+	// len(Summary), not Summary != nil. Every construction site of
+	// schemas.ResponsesReasoning in this codebase sets an empty-but-non-nil
+	// slice, and the field has no omitempty so that state survives a JSON round
+	// trip -- so the nil check was true for essentially every real message, the
+	// loop ran zero times, and the encrypted branch below was unreachable.
+	if !emittedFromContentBlocks {
+		for _, reasoningContent := range msg.ResponsesReasoning.Summary {
+			text := reasoningContent.Text
+			thinkingBlocks = append(thinkingBlocks, CohereContentBlock{
 				Type:     CohereContentBlockTypeThinking,
-				Thinking: &encryptedText,
-			}
-			thinkingBlocks = append(thinkingBlocks, thinkingBlock)
+				Thinking: &text,
+			})
 		}
 	}
 
+	// Emitted IN ADDITION to any summary, not instead of it: the visible summary
+	// and the encrypted replay token are independent facts, and the next turn
+	// needs whichever the upstream will accept. Cohere has no encrypted-reasoning
+	// field, so it travels as a marked thinking block -- imperfect, but strictly
+	// better than silently losing it.
+	if enc := msg.ResponsesReasoning.EncryptedContent; enc != nil && *enc != "" {
+		encryptedText := formatEncryptedReasoning(*enc)
+		thinkingBlocks = append(thinkingBlocks, CohereContentBlock{
+			Type:     CohereContentBlockTypeThinking,
+			Thinking: &encryptedText,
+		})
+	}
+
 	return thinkingBlocks
+}
+
+// Cohere has no encrypted-reasoning field, so the replay token travels as a
+// marked thinking block. The marker is a transport detail of THIS provider
+// pairing: both ends of it live here, and neither end is meaningful without the
+// other. Egress-only was the original bug - the token was written out and never
+// read back, so it reached clients as visible reasoning prose and was replayed
+// as if the model had thought the marker itself.
+const (
+	encryptedReasoningPrefix = "[ENCRYPTED_REASONING: "
+	encryptedReasoningSuffix = "]"
+)
+
+func formatEncryptedReasoning(enc string) string {
+	return encryptedReasoningPrefix + enc + encryptedReasoningSuffix
+}
+
+// parseEncryptedReasoning recovers a replay token from a thinking block, and
+// reports whether the block was a marker at all.
+//
+// Deliberately exact: only a block that is ENTIRELY the marker counts. A model
+// that merely mentions the phrase mid-sentence is writing prose, and treating
+// that as a replay token would both swallow real reasoning text and hand the
+// provider a token it never issued.
+func parseEncryptedReasoning(thinking string) (string, bool) {
+	if !strings.HasPrefix(thinking, encryptedReasoningPrefix) ||
+		!strings.HasSuffix(thinking, encryptedReasoningSuffix) {
+		return "", false
+	}
+	enc := thinking[len(encryptedReasoningPrefix) : len(thinking)-len(encryptedReasoningSuffix)]
+	if enc == "" {
+		return "", false
+	}
+	return enc, true
 }
 
 // convertBifrostFunctionCallToCohereMessage converts a Bifrost function call to Cohere message
@@ -1745,7 +1830,8 @@ func convertBifrostFunctionCallOutputToCohereMessage(msg *schemas.ResponsesMessa
 			if msg.ResponsesToolMessage.Output.ResponsesToolCallOutputStr != nil {
 				content.ContentStr = msg.ResponsesToolMessage.Output.ResponsesToolCallOutputStr
 			} else if msg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks != nil {
-				content.ContentBlocks = msg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks
+				// Cohere tool messages take text only; media becomes a placeholder.
+				content.ContentBlocks, _ = schemas.FlattenResponsesToolResultMedia(msg.ResponsesToolMessage.Output.ResponsesFunctionToolCallOutputBlocks)
 			}
 		}
 
@@ -1770,6 +1856,8 @@ func convertBifrostFunctionCallOutputToCohereMessage(msg *schemas.ResponsesMessa
 func convertSingleCohereMessageToBifrostMessages(cohereMsg *CohereMessage, isOutputMessage bool) []schemas.ResponsesMessage {
 	var outputMessages []schemas.ResponsesMessage
 	var reasoningContentBlocks []schemas.ResponsesMessageContentBlock
+	// Replay token recovered from a marked thinking block, if this message carried one.
+	var encryptedReasoning string
 
 	// Handle text content first
 	if cohereMsg.Content != nil {
@@ -1791,6 +1879,17 @@ func convertSingleCohereMessageToBifrostMessages(cohereMsg *CohereMessage, isOut
 			// Convert content blocks and separate reasoning blocks
 			for _, block := range cohereMsg.Content.BlocksContent {
 				if block.Type == CohereContentBlockTypeThinking {
+					// A marker block is the encrypted replay token this
+					// provider smuggles through the thinking channel, not
+					// something the model thought. It goes back to
+					// EncryptedContent, where the next turn's egress looks for
+					// it, and is kept out of the visible reasoning text.
+					if block.Thinking != nil {
+						if enc, ok := parseEncryptedReasoning(*block.Thinking); ok {
+							encryptedReasoning = enc
+							continue
+						}
+					}
 					// Collect reasoning blocks to create a single reasoning message
 					reasoningContentBlocks = append(reasoningContentBlocks, schemas.ResponsesMessageContentBlock{
 						Type: schemas.ResponsesOutputMessageContentTypeReasoning,
@@ -1836,14 +1935,23 @@ func convertSingleCohereMessageToBifrostMessages(cohereMsg *CohereMessage, isOut
 		}
 	}
 
-	// Handle reasoning blocks - prepend reasoning message if we collected any
-	if len(reasoningContentBlocks) > 0 {
+	// Handle reasoning blocks - prepend reasoning message if we collected any.
+	//
+	// The encrypted token counts on its own: a turn whose only reasoning was the
+	// replay marker has no visible blocks left after it is extracted, and
+	// gating solely on the block count would drop the token entirely - the very
+	// bug this restores.
+	if len(reasoningContentBlocks) > 0 || encryptedReasoning != "" {
+		reasoning := &schemas.ResponsesReasoning{
+			Summary: []schemas.ResponsesReasoningSummary{},
+		}
+		if encryptedReasoning != "" {
+			reasoning.EncryptedContent = new(encryptedReasoning)
+		}
 		reasoningMessage := schemas.ResponsesMessage{
-			ID:   schemas.Ptr("rs_" + fmt.Sprintf("%d", time.Now().UnixNano())),
-			Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
-			ResponsesReasoning: &schemas.ResponsesReasoning{
-				Summary: []schemas.ResponsesReasoningSummary{},
-			},
+			ID:                 new("rs_" + fmt.Sprintf("%d", time.Now().UnixNano())),
+			Type:               new(schemas.ResponsesMessageTypeReasoning),
+			ResponsesReasoning: reasoning,
 			Content: &schemas.ResponsesMessageContent{
 				ContentBlocks: reasoningContentBlocks,
 			},

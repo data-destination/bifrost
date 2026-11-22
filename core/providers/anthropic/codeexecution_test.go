@@ -744,7 +744,7 @@ func TestCodeExecution_ToolVersionRoundTrip(t *testing.T) {
 			t.Errorf("%s: neutral version = %q, want %q", v, got, string(v))
 		}
 
-		back := convertBifrostToolToAnthropic("claude-opus-4-8", neutral, schemas.Anthropic, false)
+		back := convertBifrostToolToAnthropic(schemas.ResolveModelCaps(schemas.Anthropic, "claude-opus-4-8"), neutral, schemas.Anthropic, false)
 		if back == nil || back.Type == nil {
 			t.Fatalf("%s: reverse produced no tool", v)
 		}
@@ -759,7 +759,7 @@ func TestCodeExecution_ToolVersionRoundTrip(t *testing.T) {
 		Type:                         schemas.ResponsesToolTypeCodeInterpreter,
 		ResponsesToolCodeInterpreter: &schemas.ResponsesToolCodeInterpreter{},
 	}
-	back := convertBifrostToolToAnthropic("claude-opus-4-8", noVer, schemas.Anthropic, false)
+	back := convertBifrostToolToAnthropic(schemas.ResolveModelCaps(schemas.Anthropic, "claude-opus-4-8"), noVer, schemas.Anthropic, false)
 	if back == nil || back.Type == nil || *back.Type != AnthropicToolTypeCodeExecution {
 		t.Errorf("absent-version fallback = %v, want %s", back, AnthropicToolTypeCodeExecution)
 	}
@@ -845,8 +845,8 @@ func TestCodeExecution_ProgrammaticStreamRoundTrip(t *testing.T) {
 						firstWsStartPos = pos
 					}
 				}
-				// web_search delivers its query whole in content_block_start.input
-				// (no input_json_delta), so seed it here.
+				// Accept input supplied at block start as well as streamed deltas;
+				// concatenating both also detects accidental duplicate delivery.
 				if len(e.ContentBlock.Input) > 0 && string(e.ContentBlock.Input) != "{}" {
 					inputByIndex[idx] += string(e.ContentBlock.Input)
 				}

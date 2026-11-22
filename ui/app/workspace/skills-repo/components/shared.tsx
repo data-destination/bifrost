@@ -12,6 +12,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tree, type BaseNodeData, type TreeNode } from "@/components/ui/treeView";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { SkillFileEntry } from "@/lib/types/skills";
 import { cn } from "@/lib/utils";
 import { getApiBaseUrl } from "@/lib/utils/port";
@@ -37,6 +38,7 @@ import {
 	X,
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useTranslation } from "react-i18next";
 import { FilePreviewPane, getFileServeUrl } from "./filePreview";
 import { formatYamlRecord } from "./helpers";
 
@@ -91,6 +93,7 @@ export function HeaderMetaItem({
 
 /** Shows the description clamped to 3 lines with a Show more/less toggle when it overflows. */
 function ClampedDescription({ description }: { description: string }) {
+	const { t } = useTranslation("config");
 	const [expanded, setExpanded] = useState(false);
 	const [isOverflowing, setIsOverflowing] = useState(false);
 	const textRef = useRef<HTMLParagraphElement>(null);
@@ -120,7 +123,7 @@ function ClampedDescription({ description }: { description: string }) {
 						onClick={() => setExpanded(false)}
 						className="ml-1 cursor-pointer text-xs font-medium text-blue-600 transition-colors hover:underline dark:text-blue-400"
 					>
-						Show less
+						{t("skillsRepo.showLess")}
 					</button>
 				)}
 			</p>
@@ -131,7 +134,7 @@ function ClampedDescription({ description }: { description: string }) {
 					className="bg-card absolute right-0 bottom-0 cursor-pointer pr-4 pl-8 text-xs font-medium text-blue-600 transition-colors hover:underline dark:text-blue-400"
 				>
 					<span className="from-card pointer-events-none absolute top-0 right-full h-full w-8 bg-gradient-to-l to-transparent" />
-					Show more
+					{t("skillsRepo.showMore")}
 				</button>
 			)}
 		</div>
@@ -167,18 +170,25 @@ export function SkillHeader({
 	onBack?: () => void;
 	sticky?: boolean;
 }) {
+	const { t } = useTranslation("config");
+	const { t: tc } = useTranslation("common");
 	const [showRawDialog, setShowRawDialog] = useState(false);
 	const { copy: copyRawSkillMd, copied: copiedRawSkillMd } = useCopyToClipboard({
-		successMessage: "Copied raw SKILL.md",
-		errorMessage: "Failed to copy raw SKILL.md",
+		successMessage: t("skillsRepo.copiedRawSkillMd"),
+		errorMessage: t("skillsRepo.copyRawSkillMdFailed"),
 	});
 
 	return (
 		<>
-			<div className={cn("flex w-full flex-row items-center gap-2 bg-card relative", sticky && "sticky top-0 z-30 py-4")}>
-				<div className="flex h-5 flex-row items-center gap-2 align-middle">
+			<div
+				className={cn(
+					"bg-card relative flex w-full flex-col items-stretch gap-3 md:flex-row md:items-center md:gap-2",
+					sticky && "sticky top-0 z-30 py-4",
+				)}
+			>
+				<div className="flex min-w-0 flex-row flex-wrap items-center gap-2 align-middle md:h-5 md:flex-nowrap">
 					{onBack ? (
-						<nav aria-label="Breadcrumb" className="min-w-0">
+						<nav aria-label={t("skillsRepo.breadcrumbAria")} className="min-w-0">
 							<ol className="text-muted-foreground flex items-center gap-1.5 text-sm">
 								<li>
 									<button
@@ -187,7 +197,7 @@ export function SkillHeader({
 										onClick={onBack}
 										className="hover:text-foreground cursor-pointer transition-colors"
 									>
-										Skills
+										{t("skillsRepo.breadcrumb")}
 									</button>
 								</li>
 								<li aria-hidden="true" className="text-muted-foreground/60">
@@ -211,18 +221,18 @@ export function SkillHeader({
 							className="h-auto shrink-0 px-1 py-0 text-xs text-blue-600 dark:text-blue-400"
 							onClick={() => setShowRawDialog(true)}
 						>
-							View raw SKILL.md
+							{t("skillsRepo.viewRawSkillMd")}
 						</Button>
 					)}
 				</div>
-				<div className="absolute top-4 right-0 ml-auto flex flex-row items-center align-middle">
+				<div className="static flex min-w-0 flex-row items-center align-middle md:absolute md:top-4 md:right-0 md:ml-auto">
 					{decorators}
 					{(actions || downloadSkillName) && (
-						<div className="ml-auto flex shrink-0 items-center gap-1.5">
+						<div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 md:ml-auto md:flex-none md:shrink-0">
 							{downloadSkillName && (
 								<Button variant="outline" size="sm" asChild>
 									<a href={`${getApiBaseUrl()}/skills/serve/${encodeURIComponent(downloadSkillName)}/download.zip`} download>
-										Download ZIP
+										{t("skillsRepo.downloadZip")}
 									</a>
 								</Button>
 							)}
@@ -235,9 +245,19 @@ export function SkillHeader({
 				<ClampedDescription description={description} />
 				<TooltipProvider>
 					<div className="mt-4 flex flex-wrap items-center gap-2 pb-2">
-						<HeaderMetaItem label="License" value={license} missingText="No license defined" icon={Scale} />
-						<HeaderMetaItem label="Compatibility" value={compatibility} missingText="No compatibility defined" icon={Bot} />
-						<HeaderMetaItem label="Allowed tools" value={allowedTools} missingText="No allowed tools defined" icon={Hammer} />
+						<HeaderMetaItem label={t("skillsRepo.license")} value={license} missingText={t("skillsRepo.noLicense")} icon={Scale} />
+						<HeaderMetaItem
+							label={t("skillsRepo.compatibility")}
+							value={compatibility}
+							missingText={t("skillsRepo.noCompatibility")}
+							icon={Bot}
+						/>
+						<HeaderMetaItem
+							label={t("skillsRepo.allowedToolsShort")}
+							value={allowedTools}
+							missingText={t("skillsRepo.noAllowedTools")}
+							icon={Hammer}
+						/>
 					</div>
 				</TooltipProvider>
 			</div>
@@ -248,7 +268,7 @@ export function SkillHeader({
 						className="h-[90vh] w-full border-0 p-0 sm:w-[85vw] sm:max-w-[85vw] md:w-[75vw] md:max-w-[75vw]"
 					>
 						<DialogHeader className="sr-only">
-							<DialogTitle>Raw SKILL.md</DialogTitle>
+							<DialogTitle>{t("skillsRepo.rawSkillMd")}</DialogTitle>
 						</DialogHeader>
 						<div className="bg-muted relative overflow-hidden rounded-sm border shadow-lg">
 							<div className="absolute top-3 right-3 z-10 flex items-center gap-1">
@@ -257,13 +277,13 @@ export function SkillHeader({
 									size="icon"
 									className="bg-background/70 text-muted-foreground hover:bg-card hover:text-foreground h-8 w-8 rounded-sm"
 									onClick={() => copyRawSkillMd(composedSkillMd)}
-									aria-label={copiedRawSkillMd ? "Raw SKILL.md copied" : "Copy raw SKILL.md"}
+									aria-label={copiedRawSkillMd ? t("skillsRepo.rawSkillMdCopiedAria") : t("skillsRepo.copyRawSkillMd")}
 								>
 									{copiedRawSkillMd ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
 								</Button>
 								<DialogClose className="text-muted-foreground hover:bg-card hover:text-foreground flex h-8 w-8 cursor-pointer items-center justify-center rounded-sm transition-colors">
 									<X className="h-4 w-4" />
-									<span className="sr-only">Close</span>
+									<span className="sr-only">{tc("close")}</span>
 								</DialogClose>
 							</div>
 							<ScrollArea className="h-full" viewportClassName="bg-muted">
@@ -290,18 +310,19 @@ export function FormSection({
 	optional?: boolean;
 	helperText?: React.ReactNode;
 }) {
+	const { t } = useTranslation("config");
 	return (
 		<section className={cn("flex flex-col gap-2", className)}>
 			<div className="flex items-center gap-1.5">
 				<Label>{title}</Label>
-				{optional && <span className="text-muted-foreground text-xs">optional</span>}
+				{optional && <span className="text-muted-foreground text-xs">{t("skillsRepo.optional")}</span>}
 				{helperText && (
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<button
 								type="button"
 								className="text-muted-foreground hover:text-foreground inline-flex h-4 w-4 items-center justify-center"
-								aria-label={`About ${title}`}
+								aria-label={t("skillsRepo.aboutAria", { title })}
 							>
 								<Info className="h-3.5 w-3.5" aria-hidden="true" />
 							</button>
@@ -330,18 +351,19 @@ export function ReadOnlyYamlBlock({ title, value, className }: { title: string; 
 
 // ---------- ReadOnlyMetadataTable ----------
 export function ReadOnlyMetadataTable({ value, className }: { value: Record<string, unknown>; className?: string }) {
+	const { t } = useTranslation("config");
 	const entries = Object.entries(value);
 
 	return (
-		<FormSection title="Metadata" className={cn("flex flex-1 flex-col", className)}>
+		<FormSection title={t("skillsRepo.metadata")} className={cn("flex flex-1 flex-col", className)}>
 			<div className="flex flex-1 flex-col rounded-sm border">
-				<div className="bg-muted/30 sticky top-0 z-10 grid grid-cols-2 border-b px-3 py-2 text-sm font-medium">
-					<span>Key</span>
-					<span>Value</span>
+				<div className="bg-muted/30 sticky top-0 z-10 grid grid-cols-1 border-b px-3 py-2 text-sm font-medium sm:grid-cols-2">
+					<span>{t("skillsRepo.key")}</span>
+					<span>{t("skillsRepo.value")}</span>
 				</div>
 				<div className="text-muted-foreground flex-1 divide-y overflow-y-auto">
 					{entries.map(([key, item]) => (
-						<div key={key} className="grid grid-cols-2 gap-3 px-3 py-2.5 text-sm">
+						<div key={key} className="grid grid-cols-1 gap-3 px-3 py-2.5 text-sm sm:grid-cols-2">
 							<p className="truncate font-mono text-xs">{key}</p>
 							<p className="font-mono text-xs leading-5 break-words">{String(item)}</p>
 						</div>
@@ -404,6 +426,8 @@ export function SkillMarkdown({
 	onSelectFile?: (path: string) => void;
 	className?: string;
 }) {
+	const { t } = useTranslation("config");
+	const { t: tc } = useTranslation("common");
 	const [externalLink, setExternalLink] = useState<{
 		href: string;
 		label: string;
@@ -464,8 +488,8 @@ export function SkillMarkdown({
 			<Dialog open={externalLink != null} onOpenChange={(open) => !open && setExternalLink(null)}>
 				<DialogContent>
 					<DialogHeader>
-						<DialogTitle>Open external link?</DialogTitle>
-						<DialogDescription>This link opens outside Bifrost in a new browser tab.</DialogDescription>
+						<DialogTitle>{t("skillsRepo.openExternalLink")}</DialogTitle>
+						<DialogDescription>{t("skillsRepo.openExternalLinkDesc")}</DialogDescription>
 					</DialogHeader>
 					<div className="bg-muted/40 rounded-sm border px-3 py-2">
 						<p className="truncate text-sm font-medium">{externalLink?.label}</p>
@@ -473,7 +497,7 @@ export function SkillMarkdown({
 					</div>
 					<DialogFooter>
 						<Button variant="outline" onClick={() => setExternalLink(null)}>
-							Cancel
+							{tc("cancel")}
 						</Button>
 						<Button
 							onClick={() => {
@@ -483,7 +507,7 @@ export function SkillMarkdown({
 							}}
 						>
 							<ExternalLink className="h-4 w-4" />
-							Open link
+							{t("skillsRepo.openLink")}
 						</Button>
 					</DialogFooter>
 				</DialogContent>
@@ -501,18 +525,19 @@ export function ReadOnlySkillBody({
 	files?: SkillFileEntry[];
 	onSelectFile?: (path: string) => void;
 }) {
+	const { t } = useTranslation("config");
 	const [activeTab, setActiveTab] = useState("preview");
 
 	return (
 		<Tabs defaultValue="preview" onValueChange={setActiveTab} className="flex min-h-0 w-full flex-1 flex-col gap-2">
 			<div className="flex items-center justify-between gap-2">
-				<h2 className="text-foreground text-base leading-[normal] font-semibold">SKILL.md Body</h2>
+				<h2 className="text-foreground text-base leading-[normal] font-semibold">{t("skillsRepo.skillMdBody")}</h2>
 				<TabsList className="bg-muted h-8">
 					<TabsTrigger value="preview" className="h-6 px-2.5 text-xs">
-						Preview
+						{t("skillsRepo.preview")}
 					</TabsTrigger>
 					<TabsTrigger value="raw" className="h-6 px-2.5 text-xs">
-						Raw
+						{t("skillsRepo.raw")}
 					</TabsTrigger>
 				</TabsList>
 			</div>
@@ -528,7 +553,7 @@ export function ReadOnlySkillBody({
 					</div>
 				</TabsContent>
 				<TabsContent value="raw" className="m-0 flex-1 overflow-y-auto">
-					<pre className="min-h-full p-4 font-mono text-xs leading-5 whitespace-pre-wrap">{body || "(empty)"}</pre>
+					<pre className="min-h-full p-4 font-mono text-xs leading-5 whitespace-pre-wrap">{body || t("skillsRepo.emptyParens")}</pre>
 				</TabsContent>
 			</div>
 		</Tabs>
@@ -611,6 +636,7 @@ export function ReadOnlyFileTree({
 	// Filters the tree to files whose path matches (case-insensitive substring).
 	searchQuery?: string;
 }) {
+	const { t } = useTranslation("config");
 	const query = searchQuery.trim().toLowerCase();
 	const filteredFiles = useMemo(() => (query ? files.filter((f) => f.path.toLowerCase().includes(query)) : files), [files, query]);
 	const treeData = useMemo((): TreeNode<FileTreeNodeData>[] => {
@@ -748,6 +774,7 @@ export function ReadOnlyFileTree({
 					};
 
 					return (
+						// oxlint-disable-next-line jsx-a11y/no-static-element-interactions -- role, tabIndex and keys are set together when the row is actionable
 						<div
 							data-selected={isSelected || undefined}
 							className={cn(
@@ -762,9 +789,9 @@ export function ReadOnlyFileTree({
 									handleClick();
 								}
 							}}
-							role={hasChildren || isDownloadable ? "button" : undefined}
+							role={hasChildren || isDownloadable ? "button" : "presentation"}
 							tabIndex={hasChildren || isDownloadable ? 0 : undefined}
-							aria-label={isFolder ? `${isExpanded ? "Collapse" : "Expand"} ${item.name}` : item.name}
+							aria-label={isFolder ? `${isExpanded ? t("skillsRepo.collapse") : t("skillsRepo.expand")} ${item.name}` : item.name}
 						>
 							<TreeRowChevron hasChildren={hasChildren} isExpanded={isExpanded} />
 							<TreeRowIcon isSkillMd={isSkillMd} isFile={isFile} isFolder={isFolder} isExpanded={isExpanded} />
@@ -774,9 +801,7 @@ export function ReadOnlyFileTree({
 							</span>
 
 							{isFolder && !isExpanded && item.childCount != null && item.childCount > 0 && (
-								<span className="text-muted-foreground text-xs">
-									{item.childCount} item{item.childCount !== 1 ? "s" : ""}
-								</span>
+								<span className="text-muted-foreground text-xs">{t("skillsRepo.itemCount", { count: item.childCount })}</span>
 							)}
 
 							{/* Download context menu (file + SKILL.md rows) */}
@@ -785,19 +810,25 @@ export function ReadOnlyFileTree({
 									className={cn(
 										"sticky right-1 z-10 ml-auto shrink-0 rounded-sm bg-muted px-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",
 									)}
+									role="presentation"
 									onClick={(e) => e.stopPropagation()}
 									onKeyDown={(e) => e.stopPropagation()}
 								>
 									<DropdownMenu>
 										<DropdownMenuTrigger asChild>
-											<Button variant="ghost" size="icon" className="h-6 w-6" aria-label={`Actions for ${item.name}`}>
+											<Button
+												variant="ghost"
+												size="icon"
+												className="h-6 w-6"
+												aria-label={t("skillsRepo.actionsForAria", { name: item.name })}
+											>
 												<MoreHorizontal className="h-3.5 w-3.5" />
 											</Button>
 										</DropdownMenuTrigger>
 										<DropdownMenuContent align="end">
 											<DropdownMenuItem className="cursor-pointer" onSelect={() => downloadFile()}>
 												<Download className="h-3.5 w-3.5" />
-												Download
+												{t("skillsRepo.download")}
 											</DropdownMenuItem>
 										</DropdownMenuContent>
 									</DropdownMenu>
@@ -807,28 +838,29 @@ export function ReadOnlyFileTree({
 							{item.type === "root" && (
 								<div
 									className="sticky right-1 z-10 ml-auto rounded-sm px-0.5"
+									role="presentation"
 									onClick={(e) => e.stopPropagation()}
 									onKeyDown={(e) => e.stopPropagation()}
 								>
 									<DropdownMenu>
 										<DropdownMenuTrigger asChild>
-											<Button variant="ghost" size="icon" className="h-6 w-6" aria-label="File actions">
+											<Button variant="ghost" size="icon" className="h-6 w-6" aria-label={t("skillsRepo.fileActions")}>
 												<MoreHorizontal className="h-3.5 w-3.5" />
 											</Button>
 										</DropdownMenuTrigger>
 										<DropdownMenuContent align="end">
 											<DropdownMenuItem className="cursor-pointer" disabled={isAllExpanded} onSelect={() => onExpandAll()}>
 												<ChevronsUpDown className="h-3.5 w-3.5" />
-												Expand all
+												{t("skillsRepo.expandAll")}
 											</DropdownMenuItem>
 											<DropdownMenuItem className="cursor-pointer" disabled={isAllCollapsed} onSelect={() => onCollapseAll()}>
 												<ChevronsDownUp className="h-3.5 w-3.5" />
-												Collapse all
+												{t("skillsRepo.collapseAll")}
 											</DropdownMenuItem>
 											<DropdownMenuItem className="cursor-pointer" asChild>
 												<a href={downloadUrl} download>
 													<Download className="h-3.5 w-3.5" />
-													Download ZIP
+													{t("skillsRepo.downloadZip")}
 												</a>
 											</DropdownMenuItem>
 										</DropdownMenuContent>
@@ -844,7 +876,7 @@ export function ReadOnlyFileTree({
 
 	if (bare) return tree;
 
-	return <FormSection title="Files">{tree}</FormSection>;
+	return <FormSection title={t("skillsRepo.files")}>{tree}</FormSection>;
 }
 
 export function SkillReadOnlyContent({
@@ -864,6 +896,8 @@ export function SkillReadOnlyContent({
 	composedSkillMd: string;
 	className?: string;
 }) {
+	const { t } = useTranslation("config");
+	const isMobile = useIsMobile();
 	const METADATA_KEY = "__metadata__";
 	const FRONTMATTER_KEY = "__extra_frontmatter__";
 
@@ -878,7 +912,7 @@ export function SkillReadOnlyContent({
 	const hasFrontmatter = extraFrontmatter && Object.keys(extraFrontmatter).length > 0;
 
 	return (
-		<ResizablePanelGroup direction="horizontal" className={cn("min-h-0 w-full", className)}>
+		<ResizablePanelGroup direction={isMobile ? "vertical" : "horizontal"} className={cn("min-h-0 w-full", className)}>
 			<ResizablePanel defaultSize="28%" minSize="18%" maxSize="50%" className="flex min-h-0 flex-col gap-2">
 				{/* Metadata & Frontmatter buttons */}
 				{(hasMetadata || hasFrontmatter) && (
@@ -893,7 +927,7 @@ export function SkillReadOnlyContent({
 									selected === METADATA_KEY ? "border-primary/20 bg-primary/10 text-primary hover:bg-primary/10" : "bg-card hover:bg-muted",
 								)}
 							>
-								Metadata
+								{t("skillsRepo.metadata")}
 							</button>
 						)}
 						{hasFrontmatter && (
@@ -908,7 +942,7 @@ export function SkillReadOnlyContent({
 										: "bg-card hover:bg-muted",
 								)}
 							>
-								Extra Frontmatter
+								{t("skillsRepo.extraFrontmatter")}
 							</button>
 						)}
 					</div>
@@ -924,14 +958,14 @@ export function SkillReadOnlyContent({
 				/>
 			</ResizablePanel>
 
-			<ResizableHandle className="mx-1.5 bg-transparent" />
+			<ResizableHandle className="mx-1.5 hidden bg-transparent md:flex" />
 
 			{/* Right: content pane */}
 			<ResizablePanel defaultSize="72%" minSize="30%" className="flex min-h-0 flex-col overflow-auto">
 				{selected === METADATA_KEY && metadata ? (
 					<ReadOnlyMetadataTable value={metadata} />
 				) : selected === FRONTMATTER_KEY && extraFrontmatter ? (
-					<ReadOnlyYamlBlock title="Extra Frontmatter" value={extraFrontmatter} />
+					<ReadOnlyYamlBlock title={t("skillsRepo.extraFrontmatter")} value={extraFrontmatter} />
 				) : selectedFile ? (
 					<FilePreviewPane file={selectedFile} skillName={skillName} mode="view" />
 				) : (
@@ -955,6 +989,7 @@ function SkillFilesSidebar({
 	selectedPath?: string;
 	onSelectPath?: (path: string) => void;
 }) {
+	const { t } = useTranslation("config");
 	const [searchQuery, setSearchQuery] = useState("");
 
 	return (
@@ -964,7 +999,7 @@ function SkillFilesSidebar({
 				<div className="relative grow">
 					<Search className="text-muted-foreground absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2" />
 					<Input
-						placeholder="Search files..."
+						placeholder={t("skillsRepo.searchFiles")}
 						value={searchQuery}
 						onChange={(e) => setSearchQuery(e.target.value)}
 						data-testid="sidebar-search"

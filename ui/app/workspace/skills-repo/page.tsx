@@ -4,6 +4,8 @@ import { parseAsBoolean, parseAsString, useQueryStates } from "nuqs";
 import { SkillCreateView } from "./components/skillCreatorView";
 import { SkillDetailView } from "./components/skillDetailsView";
 import { SkillsListView } from "./components/skillListView";
+import { useActionParam } from "@/hooks/useActionParam";
+import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 export default function SkillsRepoPage() {
 	const [urlState, setUrlState] = useQueryStates(
 		{
@@ -13,6 +15,11 @@ export default function SkillsRepoPage() {
 		},
 		{ history: "push" },
 	);
+	const canCreate = useRbac(RbacResource.SkillsRepository, RbacOperation.Create);
+	useActionParam("create", () => setUrlState({ create: true, skillId: null, edit: false }), {
+		isOpen: urlState.create,
+		enabled: canCreate,
+	});
 
 	const handleSelectSkill = (id: string, edit = false) => {
 		setUrlState({ skillId: id, edit, create: false });
@@ -33,7 +40,7 @@ export default function SkillsRepoPage() {
 	// Create view
 	if (urlState.create) {
 		return (
-			<div className="no-padding-parent flex h-full w-full flex-col p-0">
+			<div className="no-padding-parent flex h-full w-full min-w-0 flex-col p-0">
 				<SkillCreateView onCreated={handleCreated} onBack={handleBack} />
 			</div>
 		);
@@ -44,7 +51,9 @@ export default function SkillsRepoPage() {
 		return (
 			<div
 				className={
-					urlState.edit ? "no-padding-parent flex h-full w-full flex-col p-0" : "no-padding-parent flex h-full w-full flex-col p-4 pt-0"
+					urlState.edit
+						? "no-padding-parent flex h-full w-full min-w-0 flex-col p-0"
+						: "no-padding-parent flex h-full w-full min-w-0 flex-col p-4 pt-0"
 				}
 			>
 				<SkillDetailView skillId={urlState.skillId} isEditing={urlState.edit} setIsEditing={setIsEditing} onBack={handleBack} />
@@ -54,7 +63,7 @@ export default function SkillsRepoPage() {
 
 	// List view
 	return (
-		<div className="no-padding-parent flex h-[calc(100dvh_-_16px)] w-full flex-col p-4">
+		<div className="no-padding-parent flex min-h-full w-full min-w-0 flex-col p-4 md:h-[calc(var(--app-content-viewport)_-_var(--app-bottom-padding))] md:min-h-0">
 			<SkillsListView onSelectSkill={handleSelectSkill} onCreateNew={() => setUrlState({ create: true, skillId: null, edit: false })} />
 		</div>
 	);

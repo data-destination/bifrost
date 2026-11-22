@@ -5,8 +5,9 @@
 // MCP server accepts:
 //
 //   - header credentials: a virtual key (x-bf-vk / Authorization: Bearer /
-//     x-api-key) or a session id (x-bf-mcp-session-id), used for the
-//     `headers` and `both` server auth modes; and
+//     x-api-key), a JWT (Authorization: Bearer), or a session id
+//     (x-bf-mcp-session-id), used for the `headers` and `both` server auth
+//     modes; and
 //   - OAuth: full RFC 9728/8414 discovery + dynamic client registration + PKCE
 //     authorization-code flow, used for the `both` and `oauth` server modes.
 //
@@ -30,6 +31,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
@@ -75,6 +77,7 @@ func main() {
 	vk := flag.String("vk", "", "virtual key, sent as x-bf-vk (auth=headers)")
 	bearer := flag.String("bearer", "", "virtual key sent as Authorization: Bearer (auth=headers)")
 	apiKey := flag.String("api-key", "", "virtual key sent as x-api-key (auth=headers)")
+	jwt := flag.String("jwt", "", "JWT sent as Authorization: Bearer (auth=headers; mutually exclusive with -bearer)")
 	session := flag.String("session", "", "session id, sent as x-bf-mcp-session-id (auth=headers)")
 	flag.Var(extra, "header", "extra header \"Key: Value\" (repeatable, any auth)")
 	scope := flag.String("scope", "mcp", "comma-separated OAuth scopes (auth=oauth)")
@@ -89,6 +92,13 @@ func main() {
 	}
 	if *bearer != "" {
 		headers["Authorization"] = "Bearer " + *bearer
+	}
+	if *jwt != "" {
+		if *bearer != "" {
+			fmt.Fprintln(os.Stderr, "error: -bearer and -jwt both set Authorization: Bearer and are mutually exclusive")
+			os.Exit(1)
+		}
+		headers["Authorization"] = "Bearer " + *jwt
 	}
 	if *apiKey != "" {
 		headers["x-api-key"] = *apiKey
@@ -174,7 +184,23 @@ func connect(cfg *config) (*client.Client, error) {
 		}
 	}
 	fmt.Printf("connected to %s %s\n", res.ServerInfo.Name, res.ServerInfo.Version)
+	// Pointed at Bifrost's /mcp endpoint this is the aggregate of every upstream the
+	// virtual key may see; pointed at a server directly it is that server's own text.
+	if res.Instructions != "" {
+		fmt.Printf("server instructions:\n%s\n", stripControlChars(res.Instructions))
+	}
 	return c, nil
+}
+
+// stripControlChars drops terminal control sequences an upstream server could smuggle
+// into its instructions; newlines and tabs stay so the text still reads.
+func stripControlChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' || !unicode.IsControl(r) {
+			return r
+		}
+		return -1
+	}, s)
 }
 
 // withAuthRetry runs the OAuth authorization flow if err signals it, then calls

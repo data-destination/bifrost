@@ -46,6 +46,7 @@ locals {
       plugins              = var.plugins
       audit_logs           = var.audit_logs
       websocket            = var.websocket
+      server               = var.server
     } : k => v if v != null
   }
 
@@ -85,6 +86,7 @@ module "aws" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   region                       = var.region
   name_prefix                  = var.name_prefix
   tags                         = var.tags
@@ -123,6 +125,7 @@ module "gcp" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   project_id                   = var.gcp_project_id
   region                       = var.region
   name_prefix                  = var.name_prefix
@@ -157,6 +160,7 @@ module "azure" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   region                       = var.region
   name_prefix                  = var.name_prefix
   tags                         = var.tags
@@ -191,6 +195,7 @@ module "kubernetes" {
   image                        = local.image
   container_port               = local.container_port
   health_check_path            = local.health_check_path
+  ingress_path                 = var.ingress_path
   name_prefix                  = var.name_prefix
   tags                         = var.tags
   desired_count                = var.desired_count

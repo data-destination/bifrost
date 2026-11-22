@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	bifrost "github.com/maximhq/bifrost/core"
-	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
@@ -32,11 +31,13 @@ func (s *Store) LoadModelParamsFromDB(ctx context.Context) (int, error) {
 	if s.configStore == nil {
 		return 0, nil
 	}
+	s.modelParamsSyncMu.Lock()
+	defer s.modelParamsSyncMu.Unlock()
 	rows, err := s.configStore.GetModelParameters(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to load model parameters from database: %w", err)
 	}
-	if len(rows) == 0 {
+	if len(rows) == 0 && !s.hasParamsPatches() {
 		if s.logger != nil {
 			s.logger.Debug("no model parameters rows in database")
 		}
@@ -61,13 +62,19 @@ func (s *Store) SyncModelParamsFromURL(ctx context.Context) error {
 		s.logger.Debug("starting model parameters synchronization")
 	}
 
-	paramsData, err := withRetries(ctx, urlFetchMaxRetries, urlFetchMaxBackoff, func() (map[string]json.RawMessage, error) {
-		return s.loadModelParametersFromURL(ctx)
+	// Only the fetch is bounded so a hung URL cannot starve the DB fallback below.
+	fetchCtx, cancel := context.WithTimeout(ctx, paramsFetchTimeout)
+	paramsData, err := withRetries(fetchCtx, urlFetchMaxRetries, urlFetchMaxBackoff, func() (map[string]json.RawMessage, error) {
+		return s.loadModelParametersFromURL(fetchCtx)
 	})
+	cancel()
 	if err != nil {
 		if s.configStore != nil {
 			rows, dbErr := s.configStore.GetModelParameters(ctx)
-			if dbErr == nil && len(rows) > 0 {
+			if dbErr != nil {
+				return fmt.Errorf("failed to load model parameters from URL (%v) and failed to get model parameters records: %w", err, dbErr)
+			}
+			if len(rows) > 0 {
 				if s.logger != nil {
 					s.logger.Error("failed to load model parameters from URL, falling back to existing database records: %v", err)
 				}
@@ -77,22 +84,60 @@ func (s *Store) SyncModelParamsFromURL(ctx context.Context) error {
 		return fmt.Errorf("failed to load model parameters from URL and no existing data in database: %w", err)
 	}
 
+	// Reject unusable rows before either persistence or publication. A valid
+	// sibling must not let a malformed or empty feed row erase stored data.
+	usableParams := make(map[string]json.RawMessage, len(paramsData))
+	for model, data := range paramsData {
+		var caps schemas.ModelCapabilities
+		if json.Unmarshal(data, &caps) == nil && !IsEmptyModelCapabilities(&caps) {
+			usableParams[model] = data
+		}
+	}
+	if len(usableParams) == 0 {
+		if s.logger != nil {
+			s.logger.Warn("model-parameters-sync: no usable records in URL feed, keeping existing model parameters and capabilities")
+		}
+		return nil
+	}
+
+	s.modelParamsSyncMu.Lock()
+	defer s.modelParamsSyncMu.Unlock()
+	synced := len(usableParams)
 	if s.configStore != nil {
-		records := make([]configstoreTables.TableModelParameters, 0, len(paramsData))
-		for model, data := range paramsData {
+		rows, err := s.configStore.GetModelParameters(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to load model parameters before sync: %w", err)
+		}
+		merged := make(map[string]json.RawMessage, len(rows)+len(usableParams))
+		for _, row := range rows {
+			merged[row.Model] = json.RawMessage(row.Data)
+		}
+		records := make([]configstoreTables.TableModelParameters, 0, len(usableParams))
+		for model, data := range usableParams {
+			// Capabilities do not include provider metadata. Keep an existing
+			// provider row if this replacement would make its runtime lookup fail.
+			storedProvider := gjson.GetBytes(merged[model], "provider")
+			incomingProvider := gjson.GetBytes(data, "provider")
+			if storedProvider.Type == gjson.String && strings.TrimSpace(storedProvider.Str) != "" &&
+				(incomingProvider.Type != gjson.String || strings.TrimSpace(incomingProvider.Str) == "") {
+				continue
+			}
 			records = append(records, configstoreTables.TableModelParameters{
 				Model: model,
 				Data:  string(data),
 			})
+			merged[model] = data
 		}
 		if err := s.configStore.UpsertModelParametersBatch(ctx, records); err != nil {
 			return fmt.Errorf("failed to sync model parameters to database: %w", err)
 		}
+		synced = len(records)
+		s.applyModelParameters(merged)
+	} else {
+		s.applyModelParameters(usableParams)
 	}
-
-	s.applyModelParameters(paramsData)
 	if s.logger != nil {
-		s.logger.Info("successfully synced %d model parameters records", len(paramsData))
+		s.logger.Info("successfully synced %d model parameters records", synced)
 	}
 	return nil
 }
@@ -106,6 +151,8 @@ func (s *Store) LoadModelParamsFromURLIntoMemory(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load model parameters from URL: %w", err)
 	}
+	s.modelParamsSyncMu.Lock()
+	defer s.modelParamsSyncMu.Unlock()
 	s.applyModelParameters(paramsData)
 	return nil
 }
@@ -125,7 +172,7 @@ func (s *Store) loadModelParametersFromURL(ctx context.Context) (map[string]json
 	var data []byte
 
 	if parsed.Scheme == "file" {
-		data, err = os.ReadFile(filePathFromURL(parsed))
+		data, err = os.ReadFile(FilePathFromURL(parsed))
 		if err != nil {
 			return nil, fmt.Errorf("failed to read model parameters file: %w", err)
 		}
@@ -133,7 +180,7 @@ func (s *Store) loadModelParametersFromURL(ctx context.Context) (map[string]json
 		if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
 			return nil, fmt.Errorf("model parameters URL validation failed: %w", err)
 		}
-		client := &http.Client{Timeout: DefaultModelParametersTimeout}
+		client := NewHTTPClient(DefaultModelParametersTimeout)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
@@ -164,8 +211,8 @@ func (s *Store) loadModelParametersFromURL(ctx context.Context) (map[string]json
 // applyModelParameters parses the raw model-parameters JSON and updates:
 //   - supportedResponseTypes (per-model normalized output types)
 //   - supportedParams (per-model accepted request parameter names)
-//   - the provider-utils ModelParams cache (max_output_tokens,
-//     vertex_multi_region_only)
+//   - modelParameterKeys (usable row keys, independent of the parameter allowlist)
+//   - the provider-utils model capability cache
 //
 // Models with no useful info contribute nothing — the indexes are wholly
 // replaced under mu.Lock so readers see either the pre- or post-sync state,
@@ -173,29 +220,46 @@ func (s *Store) loadModelParametersFromURL(ctx context.Context) (map[string]json
 // bootstrap callers can distinguish "DB had rows but all malformed" from
 // "DB had usable rows".
 func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int {
-	modelParamsEntries := make(map[string]providerUtils.ModelParams, len(paramsData))
+	if s.configStore == nil {
+		// No rows to reload from: keep the upstream sheet so an override change
+		// can rebuild the indexes (refreshEntryOverrides).
+		s.mu.Lock()
+		s.paramsSheet = paramsData
+		s.mu.Unlock()
+	}
+	paramsData, overrideOnly := s.withParamsEntryOverrides(paramsData)
 	newResponseTypes := make(map[string][]string, len(paramsData))
 	newParamsIndex := make(map[string][]string, len(paramsData))
+	newModelKeys := make([]string, 0, len(paramsData))
 	applied := 0
 
 	for model, rawData := range paramsData {
-		var parsed modelParametersParseResult
-		if err := json.Unmarshal(rawData, &parsed); err != nil {
+		// One parse per row. ModelCapabilities covers the whole row: the flags
+		// providers read on the request path, and the endpoint/parameter surface
+		// the derived indexes below are built from.
+		var caps schemas.ModelCapabilities
+		if err := json.Unmarshal(rawData, &caps); err != nil {
 			if s.logger != nil {
 				s.logger.Warn("model-parameters-sync: skipping malformed parameters for model %s: %v", model, err)
 			}
 			continue
 		}
-		applied++
+		// A zero-value record contributes nothing to any index, and
+		// LoadModelCapabilities rejects it later anyway. Counting it would let a
+		// feed of empty rows clear the capability cache with nothing to refill it.
+		if !IsEmptyModelCapabilities(&caps) {
+			applied++
+			newModelKeys = append(newModelKeys, model)
+		}
 
-		outputs := make([]string, 0, len(parsed.SupportedEndpoints))
-		for _, endpoint := range parsed.SupportedEndpoints {
+		outputs := make([]string, 0, len(caps.SupportedEndpoints))
+		for _, endpoint := range caps.SupportedEndpoints {
 			if normalized := normalizeEndpointToOutputType(endpoint); normalized != "" && !slices.Contains(outputs, normalized) {
 				outputs = append(outputs, normalized)
 			}
 		}
-		if parsed.Mode != nil {
-			if normalized := normalizeModeToOutputType(*parsed.Mode); normalized != "" && !slices.Contains(outputs, normalized) {
+		if caps.Mode != nil {
+			if normalized := normalizeModeToOutputType(*caps.Mode); normalized != "" && !slices.Contains(outputs, normalized) {
 				outputs = append(outputs, normalized)
 			}
 		}
@@ -204,7 +268,7 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 		// even though supported_endpoints didn't mention /completions.
 		if !slices.Contains(outputs, "text_completion") {
 			if provider := gjson.GetBytes(rawData, "provider"); provider.Exists() {
-				key := makeKey(model, normalizeProvider(provider.String()), normalizeRequestType(schemas.TextCompletionRequest))
+				key := makeKeyNormalized(model, normalizeProvider(provider.String()), normalizeRequestType(schemas.TextCompletionRequest))
 				s.mu.RLock()
 				_, ok := s.pricingData[key]
 				s.mu.RUnlock()
@@ -218,30 +282,96 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 			newResponseTypes[model] = outputs
 		}
 
-		if supported := extractSupportedParams(&parsed); len(supported) > 0 {
+		if supported := extractSupportedParams(&caps); len(supported) > 0 {
 			newParamsIndex[model] = supported
 		}
 
-		var p struct {
-			MaxOutputTokens *int `json:"max_output_tokens"`
+	}
+
+	// A feed with nothing usable changes nothing: the derived indexes and the
+	// capability cache move together, or neither moves. Swapping the indexes
+	// while the guard below keeps the cache would leave the two describing
+	// different sheets while capability records still answer from the previous
+	// sheet.
+	//
+	// Every pod reloads from here on the gossip hook.
+	if applied == 0 {
+		if s.logger != nil {
+			s.logger.Warn("model-parameters-sync: no parseable records, keeping existing model parameters and capabilities")
 		}
-		if err := json.Unmarshal(rawData, &p); err == nil && (p.MaxOutputTokens != nil || parsed.VertexMultiRegionOnly != nil) {
-			modelParamsEntries[model] = providerUtils.ModelParams{
-				MaxOutputTokens:         p.MaxOutputTokens,
-				IsVertexMultiRegionOnly: parsed.VertexMultiRegionOnly,
-			}
-		}
+		return applied
 	}
 
 	s.mu.Lock()
 	s.supportedResponseTypes = newResponseTypes
 	s.supportedParams = newParamsIndex
+	s.paramsOverrideOnly = overrideOnly
+	s.modelParameterKeys = newModelKeys
 	s.mu.Unlock()
 
-	if len(modelParamsEntries) > 0 {
-		providerUtils.BulkSetModelParams(modelParamsEntries)
+	// Anything cached against the previous sheet — records and "no such model"
+	// alike — has to be re-resolved.
+	if s.onModelParametersApplied != nil {
+		s.onModelParametersApplied()
 	}
 	return applied
+}
+
+// SetOnModelParametersApplied registers a callback fired after a model-parameters
+// reload lands. The catalog uses it to drop capability records built from the
+// previous sheet; keeping it a hook means the sync path does not need to know
+// what caches exist above it.
+func (s *Store) SetOnModelParametersApplied(fn func()) {
+	s.onModelParametersApplied = fn
+}
+
+// LoadModelCapabilities resolves a runtime (provider, model) pair to its
+// capability record by reading datasheet rows out of the DB. It is the loader
+// behind the provider-utils capability cache, and it owns the key translation
+// that cache deliberately knows nothing about: the datasheet keys rows by a raw,
+// often provider-prefixed name ("azure/gpt-5.1-chat") while callers ask by bare
+// model plus provider.
+//
+// A row only answers for a model when its own provider matches, so an OpenAI
+// request for "o1" can never be served the "azure/o1" row.
+//
+// Returns (nil, nil) when nothing matches — the cache remembers that, so an
+// unknown model is looked up once rather than on every capability check. A
+// store failure returns an error instead, which keeps the caller from caching
+// "no capabilities" for a model whose row exists but was unreachable.
+func (s *Store) LoadModelCapabilities(ctx context.Context, provider schemas.ModelProvider, model string) (*schemas.ModelCapabilities, error) {
+	if model == "" {
+		return nil, nil
+	}
+	if s.configStore == nil {
+		caps, _ := s.patchedCapabilities(nil, string(provider), model)
+		return caps, nil
+	}
+	candidates := s.modelParameterCandidates(model)
+	for _, candidate := range candidates {
+		row, err := s.configStore.GetModelParametersByModel(ctx, candidate)
+		if err != nil {
+			if errors.Is(err, configstore.ErrNotFound) {
+				continue
+			}
+			return nil, fmt.Errorf("load capabilities for %s/%s: %w", provider, candidate, err)
+		}
+		if row == nil {
+			continue
+		}
+		rowProvider := gjson.Get(row.Data, "provider").String()
+		// Exact match first: normalizeProvider folds every row that contains
+		// "bedrock" (like "bedrock_mantle") onto "bedrock".
+		if rowProvider == "" || (rowProvider != string(provider) && normalizeProvider(rowProvider) != string(provider)) {
+			continue
+		}
+		if caps, ok := s.patchedCapabilities([]byte(row.Data), string(provider), model, candidate); ok {
+			return caps, nil
+		}
+	}
+	// A datasheet override can describe a model the params sheet does not list.
+	caps, _ := s.patchedCapabilities(nil, string(provider), model)
+	return caps, nil
 }
 
 // GetModelParametersByModel reads a single model-parameter row from the DB.
@@ -269,7 +399,7 @@ func (s *Store) ResolveModelParameters(ctx context.Context, model string) (*conf
 	for _, candidate := range s.modelParameterCandidates(model) {
 		params, err := s.configStore.GetModelParametersByModel(ctx, candidate)
 		if err == nil {
-			return params, nil
+			return s.patchParamsRow(params, model), nil
 		}
 		if !errors.Is(err, configstore.ErrNotFound) {
 			return nil, err
@@ -278,7 +408,55 @@ func (s *Store) ResolveModelParameters(ctx context.Context, model string) (*conf
 			firstErr = err
 		}
 	}
+	if custom := s.customParamsRow(model); custom != nil {
+		return custom, nil
+	}
 	return nil, firstErr
+}
+
+// patchParamsRow applies the datasheet override for the row's own provider,
+// if any, returning a copy so the stored row is never mutated.
+func (s *Store) patchParamsRow(row *configstoreTables.TableModelParameters, model string) *configstoreTables.TableModelParameters {
+	if row == nil {
+		return nil
+	}
+	provider := gjson.Get(row.Data, "provider").String()
+	p, ok := s.paramsPatchFor(provider, model, row.Model)
+	if !ok && normalizeProvider(provider) != provider {
+		p, ok = s.paramsPatchFor(normalizeProvider(provider), model, row.Model)
+	}
+	if !ok {
+		return row
+	}
+	patched, err := patchParamsBlob([]byte(row.Data), p.provider, p.patches...)
+	if err != nil {
+		return row
+	}
+	out := *row
+	out.Data = string(patched)
+	return &out
+}
+
+// customParamsRow synthesizes a parameters row from a datasheet override for
+// a model the params sheet does not list.
+func (s *Store) customParamsRow(model string) *configstoreTables.TableModelParameters {
+	s.entryOverridesMu.RLock()
+	var match paramsPatch
+	found := false
+	for _, p := range s.paramsPatches {
+		if p.model == model && (!found || p.provider < match.provider) {
+			match, found = p, true
+		}
+	}
+	s.entryOverridesMu.RUnlock()
+	if !found {
+		return nil
+	}
+	blob, err := patchParamsBlob(nil, match.provider, match.patches...)
+	if err != nil {
+		return nil
+	}
+	return &configstoreTables.TableModelParameters{Model: model, Data: string(blob)}
 }
 
 // modelParameterCandidates returns the ordered lookup keys tried by
@@ -311,13 +489,24 @@ func (s *Store) modelParameterCandidates(model string) []string {
 	suffix := "/" + bare
 	var qualified []string
 	s.mu.RLock()
-	for key := range s.supportedParams {
+	// A usable capability record can have no accepted request parameters.
+	// Discover it by row identity rather than membership in the allowlist.
+	for _, key := range s.modelParameterKeys {
 		if strings.HasSuffix(key, suffix) {
 			qualified = append(qualified, key)
 		}
 	}
 	s.mu.RUnlock()
-	slices.Sort(qualified)
+	// Fewest path segments first, so the plain "azure/gpt-5.1-chat" is preferred
+	// over regional and vendor-path variants like "azure/eu/gpt-5.1-chat" — a
+	// caller naming the bare model means the plain row. Ties break
+	// lexicographically so resolution is the same on every pod.
+	slices.SortFunc(qualified, func(a, b string) int {
+		if n := strings.Count(a, "/") - strings.Count(b, "/"); n != 0 {
+			return n
+		}
+		return strings.Compare(a, b)
+	})
 	for _, key := range qualified {
 		add(key)
 	}

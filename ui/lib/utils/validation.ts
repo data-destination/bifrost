@@ -169,7 +169,12 @@ export function isRedacted(value: string): boolean {
 	if (value.startsWith("env.") || value.startsWith("vault.")) {
 		return true;
 	}
-	
+
+	// Check for fixed sentinels returned by backend secret redaction.
+	const normalizedValue = value.toLowerCase();
+	if (normalizedValue === "<redacted>" || normalizedValue === "[redacted]") {
+		return true;
+	}
 
 	// Check for exact redaction pattern: 4 chars + 24 asterisks + 4 chars (total 32)
 	if (value.length === 32) {
@@ -187,6 +192,26 @@ export function isRedacted(value: string): boolean {
 	return false;
 }
 
+const PASSWORD_REQUIREMENTS = [
+	{ key: "minLength", test: (password: string) => password.length >= 12 },
+	{ key: "uppercase", test: (password: string) => /[A-Z]/.test(password) },
+	{ key: "lowercase", test: (password: string) => /[a-z]/.test(password) },
+	{ key: "number", test: (password: string) => /\d/.test(password) },
+	{ key: "special", test: (password: string) => /[^A-Za-z0-9]/.test(password) },
+] as const;
+
+/**
+ * Returns the password-policy requirements that are not satisfied.
+ * Existing credentials are skipped only when the caller explicitly confirms
+ * that the password field has not been edited.
+ */
+export type PasswordRequirementKey = (typeof PASSWORD_REQUIREMENTS)[number]["key"];
+
+export function getPasswordPolicyFailures(password?: string, isUnchanged = false): PasswordRequirementKey[] {
+	if (!password || isUnchanged) return [];
+	return PASSWORD_REQUIREMENTS.filter((requirement) => !requirement.test(password)).map((requirement) => requirement.key);
+}
+
 /**
  * Checks if a JSON string is valid
  * @param value - The JSON string to validate
@@ -201,10 +226,21 @@ export function isValidJSON(value: string): boolean {
 	}
 }
 
+// The Google credential JSON types the backend accepts in auth_credentials. Mirrors the
+// allowlist in core/providers/vertex/vertex.go; external_account is what Workload Identity
+// Federation credential configs use.
+const VERTEX_CREDENTIAL_JSON_TYPES = new Set([
+	"service_account",
+	"impersonated_service_account",
+	"authorized_user",
+	"external_account",
+	"external_account_authorized_user",
+]);
+
 /**
  * Validates Vertex auth credentials
  * @param value - The auth credentials value
- * @returns true if valid (redacted, env var, or valid service account JSON)
+ * @returns true if valid (redacted, env var, or a Google credential JSON of an accepted type)
  */
 export function isValidVertexAuthCredentials(value: string): boolean {
 	if (!value || !value.trim()) {
@@ -221,10 +257,12 @@ export function isValidVertexAuthCredentials(value: string): boolean {
 		return value.length > 4;
 	}
 
-	// Try to parse as service account JSON
+	// Try to parse as Google credential JSON; the backend dispatches on the type field.
 	try {
 		const parsed = JSON.parse(value);
-		return typeof parsed === "object" && parsed !== null && parsed.type === "service_account" && parsed.project_id && parsed.private_key;
+		return (
+			typeof parsed === "object" && parsed !== null && typeof parsed.type === "string" && VERTEX_CREDENTIAL_JSON_TYPES.has(parsed.type)
+		);
 	} catch {
 		return false;
 	}

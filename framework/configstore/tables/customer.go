@@ -21,7 +21,22 @@ type TableCustomer struct {
 	Teams       []TableTeam       `gorm:"foreignKey:CustomerID" json:"teams"`
 	VirtualKeys []TableVirtualKey `gorm:"foreignKey:CustomerID" json:"virtual_keys"`
 
+	// VirtualKeyCount is the number of virtual keys owned by this customer. Not
+	// persisted; populated by the read paths so list responses can report the
+	// count without carrying (or even loading) the full VirtualKeys relation.
+	VirtualKeyCount int `gorm:"-" json:"virtual_key_count"`
+
+	// TeamCount is the number of teams attached to this customer. Not persisted;
+	// the list read path sets it so the table can show a count without teams.
+	TeamCount int `gorm:"-" json:"team_count"`
+
 	CalendarAligned bool `gorm:"default:false" json:"calendar_aligned"`
+
+	// AccessProfile is a config-file-only field naming the enterprise access profile the customer holds
+	// in place of budgets and a rate limit of its own. Not persisted: the enterprise build attaches the
+	// profile when this entry is written from config.json (see Config.GovernanceFileSync). Part of the
+	// config hash, so changing it in the file is a change to the customer's declaration.
+	AccessProfile string `gorm:"-" json:"access_profile,omitempty"`
 
 	// Config hash is used to detect the changes synced from config.json file
 	// Every time we sync the config.json file, we will update the config hash
@@ -37,11 +52,6 @@ func (TableCustomer) TableName() string { return "governance_customers" }
 // AfterFind stamps IsCalendarAligned on owned budgets and rate limit so the
 // reset path (which reads the derived field off those objects) sees the correct value.
 func (c *TableCustomer) AfterFind(tx *gorm.DB) error {
-	for i := range c.Budgets {
-		c.Budgets[i].IsCalendarAligned = c.CalendarAligned
-	}
-	if c.RateLimit != nil {
-		c.RateLimit.IsCalendarAligned = c.CalendarAligned
-	}
+	StampCalendarAlignment(c.CalendarAligned, c.Budgets, c.RateLimit)
 	return nil
 }
