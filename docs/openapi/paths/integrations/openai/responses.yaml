@@ -59,7 +59,6 @@ responses:
 
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
   get:
@@ -97,7 +96,6 @@ responses:
         description: Maximum concurrent WebSocket connections reached.
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
 azure-responses:
@@ -142,7 +140,6 @@ azure-responses:
 # Input tokens endpoint (count tokens for Responses API format)
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
 responses-input-tokens:
@@ -172,7 +169,6 @@ responses-input-tokens:
         $ref: '../../../openapi.yaml#/components/responses/InternalError'
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
 
@@ -215,6 +211,11 @@ responses-by-id:
       description: Whether to include obfuscation on the response
       schema:
         type: boolean
+    - name: stream
+      in: query
+      description: When `true`, replays the stored response as SSE events instead of a single JSON object
+      schema:
+        type: boolean
     responses:
       '200':
         description: Successful response
@@ -222,6 +223,9 @@ responses-by-id:
           application/json:
             schema:
               $ref: '../../../schemas/integrations/openai/responses.yaml#/OpenAIResponsesResponse'
+          text/event-stream:
+            schema:
+              $ref: '../../../schemas/integrations/openai/responses.yaml#/OpenAIResponsesStreamResponse'
       '400':
         $ref: '../../../openapi.yaml#/components/responses/BadRequest'
       '404':
@@ -230,7 +234,6 @@ responses-by-id:
         $ref: '../../../openapi.yaml#/components/responses/InternalError'
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
   delete:
@@ -269,7 +272,6 @@ responses-by-id:
         $ref: '../../../openapi.yaml#/components/responses/InternalError'
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
 
@@ -311,7 +313,6 @@ responses-cancel:
         $ref: '../../../openapi.yaml#/components/responses/InternalError'
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
 
@@ -376,6 +377,5 @@ responses-input-items:
         $ref: '../../../openapi.yaml#/components/responses/InternalError'
     security:
     - BearerAuth: []
-    - BasicAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []

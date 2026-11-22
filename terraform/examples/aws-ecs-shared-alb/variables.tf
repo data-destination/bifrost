@@ -61,7 +61,7 @@ variable "image_repository" {
 variable "image_tag" {
   description = "Bifrost OSS Docker image tag (maximhq/bifrost)."
   type        = string
-  default     = "latest"
+  default     = "v2.6.0"
 }
 
 # --- Bifrost config ---

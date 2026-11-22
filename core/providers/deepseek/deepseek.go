@@ -3,6 +3,7 @@ package deepseek
 
 import (
 	"context"
+	"maps"
 	"strings"
 	"time"
 
@@ -69,59 +70,148 @@ func (provider *DeepSeekProvider) anthropicHeaders(key schemas.Key) map[string]s
 	return headers
 }
 
-// disableThinkingForForcedToolChoice disables thinking when it would otherwise be
-// rejected by DeepSeek's OpenAI-compatible endpoint. This covers two distinct cases:
+// applyDeepSeekThinkingCompatibility returns a request with thinking forced off when
+// DeepSeek's OpenAI-compatible endpoint would otherwise reject it. Thinking is enabled by
+// default upstream (effort "high"), so this shim stays as narrow as possible: anything it
+// catches silently loses reasoning, with no error surfaced to the caller.
 //
-//  1. A forced tool_choice ("required"/"any", or the struct form pinning a specific
-//     function/custom/allowed_tools call) — DeepSeek rejects a forced tool_choice while
-//     thinking is enabled (the default).
-//  2. A conversation that already contains an assistant turn without reasoning_content
-//     (e.g. synthetic/injected history, or a turn produced while thinking was off) —
-//     DeepSeek requires prior reasoning_content to be replayed once thinking is on, so if
-//     any assistant turn is missing it, thinking must stay off for the whole request.
-func disableThinkingForForcedToolChoice(request *schemas.BifrostChatRequest) {
-	if request.Params == nil {
-		return
+// The original request is never mutated. Params and ExtraParams are shared with the caller
+// and with any fallback attempt against a different provider, so writing through would leak
+// thinking:disabled well beyond this call.
+func applyDeepSeekThinkingCompatibility(request *schemas.BifrostChatRequest) *schemas.BifrostChatRequest {
+	if request == nil || request.Params == nil {
+		return request
+	}
+	if !requiresDeepSeekThinkingDisabled(request) {
+		return request
 	}
 
-	disable := false
+	paramsCopy := *request.Params
+	extraParams := make(map[string]any, len(paramsCopy.ExtraParams)+1)
+	maps.Copy(extraParams, paramsCopy.ExtraParams)
+	extraParams["thinking"] = map[string]any{"type": "disabled"}
+	paramsCopy.ExtraParams = extraParams
 
+	requestCopy := *request
+	requestCopy.Params = &paramsCopy
+	return &requestCopy
+}
+
+// requiresDeepSeekThinkingDisabled reports whether DeepSeek's OpenAI-compatible endpoint
+// would reject this request with thinking on. Two cases qualify:
+//
+//  1. A forced tool_choice ("required"/"any", or the struct form pinning a specific
+//     function/custom/allowed_tools call) — DeepSeek returns 400 "Thinking mode does not
+//     support this tool_choice" while thinking is enabled.
+//  2. A history containing an assistant tool_call turn that carries no replayable
+//     reasoning. DeepSeek requires reasoning_content to be replayed on tool_call turns and
+//     400s without it; when the caller cannot supply it, thinking has to stay off. Only
+//     ChatAssistantMessage.Reasoning counts here - reasoning_details is inbound-only and
+//     never reaches the wire - and this is judged from the messages alone, since a caller
+//     may replay tool_call turns without re-declaring Params.Tools.
+//
+// Everything else keeps thinking on. In particular, a plain multi-turn conversation needs no
+// reasoning replay whatsoever — per DeepSeek's thinking-mode guide, "the intermediate
+// assistant's reasoning_content does not need to participate in the context concatenation"
+// when there is no tool call. Assistant turns without reasoning are therefore expected and
+// must not disable thinking (issue #5887).
+func requiresDeepSeekThinkingDisabled(request *schemas.BifrostChatRequest) bool {
 	if tc := request.Params.ToolChoice; tc != nil {
 		switch {
 		case tc.ChatToolChoiceStr != nil:
 			switch schemas.ChatToolChoiceType(*tc.ChatToolChoiceStr) {
 			case schemas.ChatToolChoiceTypeRequired, schemas.ChatToolChoiceTypeAny:
-				disable = true
+				return true
 			}
 		case tc.ChatToolChoiceStruct != nil:
 			switch tc.ChatToolChoiceStruct.Type {
 			case schemas.ChatToolChoiceTypeRequired, schemas.ChatToolChoiceTypeAny,
 				schemas.ChatToolChoiceTypeFunction, schemas.ChatToolChoiceTypeCustom,
 				schemas.ChatToolChoiceTypeAllowedTools:
-				disable = true
+				return true
 			}
 		}
 	}
 
-	if !disable {
-		for _, msg := range request.Input {
-			if msg.Role != schemas.ChatMessageRoleAssistant {
-				continue
-			}
-			if msg.ChatAssistantMessage == nil || msg.ChatAssistantMessage.Reasoning == nil {
-				disable = true
-				break
-			}
+	// The replay requirement follows the messages, not the tool declarations: a caller that
+	// drops Params.Tools on a final summarizing turn still replays the assistant tool_call
+	// turns, and DeepSeek still demands reasoning_content on them.
+	for _, msg := range request.Input {
+		if msg.Role != schemas.ChatMessageRoleAssistant || msg.ChatAssistantMessage == nil {
+			continue
+		}
+		if len(msg.ChatAssistantMessage.ToolCalls) == 0 {
+			continue
+		}
+		// Only Reasoning can satisfy the replay requirement: it is the sole field
+		// ConvertBifrostMessagesToOpenAIMessages copies onto the outbound assistant
+		// message, as reasoning_content. ReasoningDetails is inbound-only and never
+		// reaches the wire (see core/providers/openai/types.go), so a details-only turn
+		// would keep thinking on and then 400 for the missing reasoning_content.
+		if msg.ChatAssistantMessage.Reasoning == nil {
+			return true
 		}
 	}
 
-	if !disable {
+	return false
+}
+
+// stampServedModel records the model DeepSeek actually served as the server-side
+// fallback model
+func stampServedModel(extraFields *schemas.BifrostResponseExtraFields, usage *schemas.BifrostLLMUsage, requested, served string) {
+	if served == "" {
 		return
 	}
-	if request.Params.ExtraParams == nil {
-		request.Params.ExtraParams = make(map[string]any, 1)
+	if strings.EqualFold(served, requested) {
+		served = ""
+		if caps := providerUtils.CapabilitiesFor(schemas.DeepSeek, requested); caps != nil && caps.ServerSideModel != nil {
+			served = *caps.ServerSideModel
+		}
 	}
-	request.Params.ExtraParams["thinking"] = map[string]any{"type": "disabled"}
+	if served == "" || strings.EqualFold(served, requested) {
+		return
+	}
+	if extraFields != nil {
+		extraFields.RoutingInfo.ServerSideFallbackModel = new(served)
+	}
+	if usage != nil {
+		usage.ServerSideFallbackModel = new(served)
+	}
+}
+
+// servedModelPostHookRunner stamps the served model on every stream chunk, error and
+// the accumulated stream usage once any chunk has revealed it.
+func servedModelPostHookRunner(requested string, next schemas.PostHookRunner) schemas.PostHookRunner {
+	var served string
+	return func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		var usage *schemas.BifrostLLMUsage
+		if result != nil {
+			switch {
+			case result.ChatResponse != nil:
+				if result.ChatResponse.Model != "" {
+					served = result.ChatResponse.Model
+				}
+				usage = result.ChatResponse.Usage
+			case result.TextCompletionResponse != nil:
+				if result.TextCompletionResponse.Model != "" {
+					served = result.TextCompletionResponse.Model
+				}
+				usage = result.TextCompletionResponse.Usage
+			case result.ResponsesStreamResponse != nil && result.ResponsesStreamResponse.Response != nil:
+				if result.ResponsesStreamResponse.Response.Model != "" {
+					served = result.ResponsesStreamResponse.Response.Model
+				}
+			}
+			stampServedModel(result.GetExtraFields(), usage, requested, served)
+		}
+		if accumulated, ok := ctx.Value(schemas.BifrostContextKeyStreamAccumulatedUsage).(*schemas.BifrostLLMUsage); ok {
+			stampServedModel(nil, accumulated, requested, served)
+		}
+		if bifrostErr != nil {
+			stampServedModel(nil, bifrostErr.ExtraFields.BilledUsage, requested, served)
+		}
+		return next(ctx, result, bifrostErr)
+	}
 }
 
 // GetProviderKey returns the provider identifier for DeepSeek.
@@ -149,7 +239,7 @@ func (provider *DeepSeekProvider) ListModels(ctx *schemas.BifrostContext, keys [
 // Returns a BifrostResponse containing the completion results or an error if the request fails.
 func (provider *DeepSeekProvider) TextCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostTextCompletionRequest) (*schemas.BifrostTextCompletionResponse, *schemas.BifrostError) {
 	ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-	return openai.HandleOpenAITextCompletionRequest(
+	resp, bifrostErr := openai.HandleOpenAITextCompletionRequest(
 		ctx,
 		provider.client,
 		provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/beta/completions"),
@@ -163,6 +253,10 @@ func (provider *DeepSeekProvider) TextCompletion(ctx *schemas.BifrostContext, ke
 		nil,
 		provider.logger,
 	)
+	if resp != nil {
+		stampServedModel(&resp.ExtraFields, resp.Usage, request.Model, resp.Model)
+	}
+	return resp, bifrostErr
 }
 
 // TextCompletionStream performs a streaming text completion request to DeepSeek's API.
@@ -182,7 +276,7 @@ func (provider *DeepSeekProvider) TextCompletionStream(ctx *schemas.BifrostConte
 		providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 		provider.GetProviderKey(),
 		nil,
-		postHookRunner,
+		servedModelPostHookRunner(request.Model, postHookRunner),
 		nil,
 		nil,
 		provider.logger,
@@ -192,7 +286,18 @@ func (provider *DeepSeekProvider) TextCompletionStream(ctx *schemas.BifrostConte
 
 // ChatCompletion performs a chat completion request to DeepSeek's Anthropic-compatible API.
 func (provider *DeepSeekProvider) ChatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	resp, bifrostErr := provider.chatCompletion(ctx, key, request)
+	if resp != nil {
+		stampServedModel(&resp.ExtraFields, resp.Usage, request.Model, resp.Model)
+	}
+	return resp, bifrostErr
+}
+
+func (provider *DeepSeekProvider) chatCompletion(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
 	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
+		if bifrostErr := rejectUnsupportedChatContent(request); bifrostErr != nil {
+			return nil, bifrostErr
+		}
 		return anthropic.HandleAnthropicChatCompletionRequest(
 			ctx,
 			provider.client,
@@ -211,7 +316,7 @@ func (provider *DeepSeekProvider) ChatCompletion(ctx *schemas.BifrostContext, ke
 	}
 
 	ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-	disableThinkingForForcedToolChoice(request)
+	request = applyDeepSeekThinkingCompatibility(request)
 	return openai.HandleOpenAIChatCompletionRequest(
 		ctx,
 		provider.client,
@@ -233,7 +338,11 @@ func (provider *DeepSeekProvider) ChatCompletion(ctx *schemas.BifrostContext, ke
 // It supports real-time streaming of responses using Server-Sent Events (SSE).
 // Returns a channel containing BifrostStreamChunk objects representing the stream or an error if the request fails.
 func (provider *DeepSeekProvider) ChatCompletionStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostChatRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+	postHookRunner = servedModelPostHookRunner(request.Model, postHookRunner)
 	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
+		if bifrostErr := rejectUnsupportedChatContent(request); bifrostErr != nil {
+			return nil, bifrostErr
+		}
 		jsonData, bifrostErr := anthropic.BuildAnthropicChatRequestBody(ctx, request, anthropic.AnthropicRequestBuildConfig{
 			Provider:                  schemas.DeepSeek,
 			IsStreaming:               true,
@@ -265,7 +374,7 @@ func (provider *DeepSeekProvider) ChatCompletionStream(ctx *schemas.BifrostConte
 	}
 
 	ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-	disableThinkingForForcedToolChoice(request)
+	request = applyDeepSeekThinkingCompatibility(request)
 	return openai.HandleOpenAIChatCompletionStreaming(
 		ctx,
 		provider.streamingClient,
@@ -292,7 +401,10 @@ func (provider *DeepSeekProvider) ChatCompletionStream(ctx *schemas.BifrostConte
 // Responses performs a Responses API request against DeepSeek's Anthropic-compatible endpoint.
 func (provider *DeepSeekProvider) Responses(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostResponsesRequest) (*schemas.BifrostResponsesResponse, *schemas.BifrostError) {
 	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
-		return anthropic.HandleAnthropicResponsesRequest(
+		if bifrostErr := rejectUnsupportedResponsesContent(request); bifrostErr != nil {
+			return nil, bifrostErr
+		}
+		resp, bifrostErr := anthropic.HandleAnthropicResponsesRequest(
 			ctx,
 			provider.client,
 			provider.networkConfig.BaseURL+providerUtils.GetPathFromContext(ctx, "/anthropic/v1/messages"),
@@ -307,6 +419,10 @@ func (provider *DeepSeekProvider) Responses(ctx *schemas.BifrostContext, key sch
 			nil,
 			provider.logger,
 		)
+		if resp != nil {
+			stampServedModel(&resp.ExtraFields, nil, request.Model, resp.Model)
+		}
+		return resp, bifrostErr
 	}
 
 	chatResponse, err := provider.ChatCompletion(ctx, key, request.ToChatRequest())
@@ -315,6 +431,7 @@ func (provider *DeepSeekProvider) Responses(ctx *schemas.BifrostContext, key sch
 	}
 
 	response := chatResponse.ToBifrostResponsesResponse()
+	stampServedModel(&response.ExtraFields, nil, request.Model, response.Model)
 
 	return response, nil
 }
@@ -322,6 +439,9 @@ func (provider *DeepSeekProvider) Responses(ctx *schemas.BifrostContext, key sch
 // ResponsesStream performs a streaming Responses API request to DeepSeek's Anthropic-compatible endpoint.
 func (provider *DeepSeekProvider) ResponsesStream(ctx *schemas.BifrostContext, postHookRunner schemas.PostHookRunner, postHookSpanFinalizer func(context.Context), key schemas.Key, request *schemas.BifrostResponsesRequest) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
 	if anthropic.ResolveUseAnthropicEndpoints(ctx, key) {
+		if bifrostErr := rejectUnsupportedResponsesContent(request); bifrostErr != nil {
+			return nil, bifrostErr
+		}
 		jsonData, bifrostErr := anthropic.BuildAnthropicResponsesRequestBody(ctx, request, anthropic.AnthropicRequestBuildConfig{
 			Provider:                  schemas.DeepSeek,
 			IsStreaming:               true,
@@ -344,7 +464,7 @@ func (provider *DeepSeekProvider) ResponsesStream(ctx *schemas.BifrostContext, p
 			providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest),
 			providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse),
 			provider.GetProviderKey(),
-			postHookRunner,
+			servedModelPostHookRunner(request.Model, postHookRunner),
 			nil,
 			nil,
 			provider.logger,
@@ -375,6 +495,11 @@ func (provider *DeepSeekProvider) Speech(ctx *schemas.BifrostContext, key schema
 // Rerank is not supported by the DeepSeek provider.
 func (provider *DeepSeekProvider) Rerank(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostRerankRequest) (*schemas.BifrostRerankResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.RerankRequest, provider.GetProviderKey())
+}
+
+// Decision is not supported by the DeepSeek provider.
+func (provider *DeepSeekProvider) Decision(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostDecisionRequest) (*schemas.BifrostDecisionResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.DecisionRequest, provider.GetProviderKey())
 }
 
 // OCR is not supported by the DeepSeek provider.
@@ -445,6 +570,11 @@ func (provider *DeepSeekProvider) VideoDelete(_ *schemas.BifrostContext, _ schem
 // VideoList is not supported by DeepSeek provider.
 func (provider *DeepSeekProvider) VideoList(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostVideoListRequest) (*schemas.BifrostVideoListResponse, *schemas.BifrostError) {
 	return nil, providerUtils.NewUnsupportedOperationError(schemas.VideoListRequest, provider.GetProviderKey())
+}
+
+// VideoEdit is not supported by the DeepSeek provider.
+func (provider *DeepSeekProvider) VideoEdit(_ *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostVideoEditRequest) (*schemas.BifrostVideoEditResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.VideoEditRequest, provider.GetProviderKey())
 }
 
 // VideoRemix is not supported by DeepSeek provider.
@@ -521,8 +651,14 @@ func (provider *DeepSeekProvider) CountTokens(ctx *schemas.BifrostContext, key s
 		},
 		provider.anthropicHeaders(key),
 		provider.networkConfig.ExtraHeaders,
+		nil,
 		provider.logger,
 	)
+}
+
+// ModelRetrieve is not supported by the DeepSeek provider.
+func (provider *DeepSeekProvider) ModelRetrieve(ctx *schemas.BifrostContext, key schemas.Key, request *schemas.BifrostModelRetrieveRequest) (*schemas.BifrostModelRetrieveResponse, *schemas.BifrostError) {
+	return nil, providerUtils.NewUnsupportedOperationError(schemas.ModelRetrieveRequest, provider.GetProviderKey())
 }
 
 // Compaction is not supported by the DeepSeek provider.

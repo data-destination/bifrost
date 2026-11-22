@@ -3,6 +3,8 @@ package sidekiq
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,11 +19,20 @@ type Store interface {
 	GetSidekiqJob(ctx context.Context, id string) (*tables.TableSidekiqJob, error)
 	// ClaimSidekiqJob atomically claims a job for runnerID; returns true only for the winner.
 	ClaimSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time) (bool, error)
+	// ClaimPartitionedSidekiqJob claims a partitioning-keyed job only when it is next in
+	// line for its key (no other same-key job running, no older same-key job pending).
+	ClaimPartitionedSidekiqJob(ctx context.Context, id, runnerID string, staleBefore time.Time, partitioningKey string, createdAt time.Time) (bool, error)
 	// HeartbeatSidekiqJob bumps updated_at for a job still owned by runnerID; returns false on lost ownership.
 	HeartbeatSidekiqJob(ctx context.Context, id, runnerID string) (bool, error)
 	UpdateSidekiqJobProgress(ctx context.Context, id, runnerID, metadata string) error
 	CompleteSidekiqJob(ctx context.Context, id, runnerID, metadata string) error
 	FailSidekiqJob(ctx context.Context, id, runnerID, metadata, lastErr string) error
+	// CancelSidekiqJob flips a pending or running job to cancelled. Returns true only
+	// when this call performed the transition (false = unknown or already terminal).
+	CancelSidekiqJob(ctx context.Context, id string) (bool, error)
+	// FinalizeCancelledSidekiqJob stores the last metadata snapshot of a cancelled job
+	// so its partial progress survives.
+	FinalizeCancelledSidekiqJob(ctx context.Context, id, runnerID, metadata string) error
 	// ListClaimableSidekiqJobs returns pending jobs and running jobs whose heartbeat is older than staleBefore.
 	ListClaimableSidekiqJobs(ctx context.Context, staleBefore time.Time) ([]tables.TableSidekiqJob, error)
 }
@@ -33,6 +44,16 @@ type ProgressFunc func(metadata string) error
 // progress callback. Returns final metadata and an error. Nil error completes the job; non-nil fails it.
 // The context is cancelled if this node loses ownership or on shutdown.
 type HandlerFunc func(ctx context.Context, job tables.TableSidekiqJob, progress ProgressFunc) (finalMetadata string, err error)
+
+// JobSummary is the kind-independent view of a job's progress, derived from its opaque metadata.
+type JobSummary struct {
+	Done    int64
+	Total   int64
+	Message string
+}
+
+// SummarizeFunc extracts a JobSummary from a job's metadata JSON. It must tolerate malformed input.
+type SummarizeFunc func(metadata string) JobSummary
 
 const (
 	DispatchInterval  = 30 * time.Second
@@ -47,7 +68,10 @@ type Runner struct {
 	store    Store
 	logger   schemas.Logger
 	handlers map[string]HandlerFunc
-	mu       sync.RWMutex
+	// summarizers holds the optional per-kind progress extractors, guarded by mu.
+	summarizers map[string]SummarizeFunc
+	quiet       map[string]struct{} // kinds whose completed jobs are left out of listings, guarded by mu
+	mu          sync.RWMutex
 
 	// runnerID fences job mutations to the node that claimed the job.
 	// Empty string disables the stale window so crashed jobs are immediately re-claimable.
@@ -59,6 +83,13 @@ type Runner struct {
 	// inflight tracks job IDs being processed on this node to prevent duplicate goroutines.
 	inflightMu sync.Mutex
 	inflight   map[string]struct{}
+
+	// jobCancels maps a claimed job's ID to the cancel func of its handler context.
+	// Cancel uses it to stop a job running on this node the moment the request lands,
+	// instead of waiting up to a heartbeat interval for the status change to be noticed.
+	// Entries exist only between claim and handler return.
+	jobCancelsMu sync.Mutex
+	jobCancels   map[string]context.CancelFunc
 
 	baseCtx context.Context
 	cancel  context.CancelFunc
@@ -78,9 +109,12 @@ func New(store Store, logger schemas.Logger, maxConcurrent int, runnerID string)
 		store:             store,
 		logger:            logger,
 		handlers:          make(map[string]HandlerFunc),
+		summarizers:       make(map[string]SummarizeFunc),
+		quiet:             make(map[string]struct{}),
 		runnerID:          runnerID,
 		heartbeatInterval: HeartbeatInterval,
 		inflight:          make(map[string]struct{}),
+		jobCancels:        make(map[string]context.CancelFunc),
 		baseCtx:           ctx,
 		cancel:            cancel,
 		sem:               make(chan struct{}, maxConcurrent),
@@ -100,6 +134,48 @@ func (r *Runner) Register(kind string, fn HandlerFunc) {
 	r.handlers[kind] = fn
 }
 
+// RegisterSummarizer binds a progress extractor to a job kind so generic views can show
+// done/total without knowing the kind's metadata shape. Kinds without one report no progress.
+func (r *Runner) RegisterSummarizer(kind string, fn SummarizeFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.summarizers[kind] = fn
+}
+
+// RegisterQuietOnSuccess marks a kind as routine: a job of it that completed is
+// left out of job listings, while one waiting, running, failed or cancelled is
+// still shown. For work queued on a timer, which would otherwise fill a
+// listing with runs nobody has to act on.
+func (r *Runner) RegisterQuietOnSuccess(kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.quiet[kind] = struct{}{}
+}
+
+// QuietOnSuccessKinds returns the kinds registered with RegisterQuietOnSuccess,
+// sorted.
+func (r *Runner) QuietOnSuccessKinds() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	kinds := make([]string, 0, len(r.quiet))
+	for kind := range r.quiet {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	return kinds
+}
+
+// Summarize returns the progress of a job of the given kind and whether the kind has a summarizer.
+func (r *Runner) Summarize(kind, metadata string) (JobSummary, bool) {
+	r.mu.RLock()
+	fn, ok := r.summarizers[kind]
+	r.mu.RUnlock()
+	if !ok {
+		return JobSummary{}, false
+	}
+	return fn(metadata), true
+}
+
 func (r *Runner) handlerFor(kind string) (HandlerFunc, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -110,14 +186,24 @@ func (r *Runner) handlerFor(kind string) (HandlerFunc, bool) {
 // Enqueue persists a new pending job and starts it as soon as a concurrency slot is free.
 // Returns once the DB row is committed so the caller can respond immediately.
 func (r *Runner) Enqueue(ctx context.Context, id, kind, metadata, createdBy string) error {
+	return r.EnqueuePartitioned(ctx, id, kind, "", metadata, createdBy)
+}
+
+// EnqueuePartitioned is Enqueue for a job that must run serially within partitioningKey:
+// jobs sharing a non-empty key run one-at-a-time in FIFO (created_at) order across
+// the cluster (see ClaimPartitionedSidekiqJob). An empty key behaves exactly like
+// Enqueue. The eager spawn is safe either way — a not-yet-runnable partitioned job
+// simply fails to claim and is picked up later by the dispatcher.
+func (r *Runner) EnqueuePartitioned(ctx context.Context, id, kind, partitioningKey, metadata, createdBy string) error {
 	if _, ok := r.handlerFor(kind); !ok {
 		return fmt.Errorf("sidekiq: no handler registered for kind %q", kind)
 	}
 	job := &tables.TableSidekiqJob{
-		ID:       id,
-		Kind:     kind,
-		Status:   tables.SidekiqStatusPending,
-		Metadata: metadata,
+		ID:              id,
+		Kind:            kind,
+		Status:          tables.SidekiqStatusPending,
+		Metadata:        metadata,
+		PartitioningKey: partitioningKey,
 	}
 	if createdBy != "" {
 		job.CreatedByUserID = &createdBy
@@ -127,6 +213,61 @@ func (r *Runner) Enqueue(ctx context.Context, id, kind, metadata, createdBy stri
 	}
 	r.spawn(*job)
 	return nil
+}
+
+// Cancel stops a pending or running job. It flips the durable row to cancelled
+// first — so the dispatcher will not re-claim it and the reaper will not fail it,
+// whatever happens next — and then cancels the handler's context if the job
+// happens to be running on this node, which stops the work within one checkpoint
+// instead of one heartbeat.
+//
+// A job owned by another node is stopped by that node's next heartbeat, which is
+// fenced on status = running and therefore reads the cancellation as lost
+// ownership. Cancelling an unknown or already-terminal job is a no-op: it returns
+// false with no error, since the caller's intent ("this job should not be
+// running") already holds.
+func (r *Runner) Cancel(ctx context.Context, id string) (bool, error) {
+	cancelled, err := r.store.CancelSidekiqJob(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	// Signal the local handler even when the row was already terminal: another node
+	// may have cancelled it while this node still runs the goroutine.
+	r.cancelLocal(id)
+	return cancelled, nil
+}
+
+// cancelLocal cancels the handler context of a job running on this node, if any.
+func (r *Runner) cancelLocal(id string) {
+	r.jobCancelsMu.Lock()
+	cancel, ok := r.jobCancels[id]
+	r.jobCancelsMu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
+func (r *Runner) registerJobCancel(id string, cancel context.CancelFunc) (unregister func()) {
+	r.jobCancelsMu.Lock()
+	r.jobCancels[id] = cancel
+	r.jobCancelsMu.Unlock()
+	return func() {
+		r.jobCancelsMu.Lock()
+		delete(r.jobCancels, id)
+		r.jobCancelsMu.Unlock()
+	}
+}
+
+// isCancelled re-reads the job row to distinguish a cancellation from the other
+// reasons a handler context dies (node shutdown, lost ownership). It is only
+// consulted on the error path of a context-cancelled handler, so the extra read
+// costs nothing in the normal case.
+func (r *Runner) isCancelled(id string) bool {
+	job, err := r.store.GetSidekiqJob(r.baseCtx, id)
+	if err != nil || job == nil {
+		return false
+	}
+	return job.Status == tables.SidekiqStatusCancelled
 }
 
 func (r *Runner) staleBefore() time.Time {
@@ -191,7 +332,15 @@ func (r *Runner) execute(job tables.TableSidekiqJob) {
 		}
 	}()
 
-	claimed, err := r.store.ClaimSidekiqJob(r.baseCtx, job.ID, r.runnerID, r.staleBefore())
+	var claimed bool
+	var err error
+	if job.PartitioningKey != "" {
+		// Partitioned jobs claim only when next in line for their key; a blocked one
+		// stays pending and is retried on a later dispatch tick.
+		claimed, err = r.store.ClaimPartitionedSidekiqJob(r.baseCtx, job.ID, r.runnerID, r.staleBefore(), job.PartitioningKey, job.CreatedAt)
+	} else {
+		claimed, err = r.store.ClaimSidekiqJob(r.baseCtx, job.ID, r.runnerID, r.staleBefore())
+	}
 	if err != nil {
 		r.logger.Error("sidekiq: failed to claim job %s: %v", job.ID, err)
 		return
@@ -220,6 +369,17 @@ func (r *Runner) execute(job tables.TableSidekiqJob) {
 		return
 	}
 
+	// Expose the handler's cancel func so an in-process Cancel stops this job at once.
+	// Registered after the claim (only the owner can be asked to stop) and removed as
+	// soon as the handler returns.
+	unregisterCancel := r.registerJobCancel(job.ID, cancel)
+	defer unregisterCancel()
+	// A cancel that landed between the claim and the registration above would have
+	// found no cancel func; re-check the row so the job does not run on regardless.
+	if r.isCancelled(job.ID) {
+		cancel()
+	}
+
 	stopHeartbeat := r.startHeartbeat(jobCtx, cancel, job.ID)
 	defer stopHeartbeat()
 
@@ -229,13 +389,44 @@ func (r *Runner) execute(job tables.TableSidekiqJob) {
 
 	finalMetadata, err := fn(jobCtx, job, progress)
 	if err != nil {
+		// A cancelled job unwinds through this path too: the handler sees its context
+		// die and returns ctx.Err(), or its next checkpoint fails because the row is no
+		// longer running. Neither is a failure — the status is already cancelled, so
+		// only the partial progress needs persisting.
+		if jobCtx.Err() != nil && r.isCancelled(job.ID) {
+			r.logger.Info("sidekiq: job %s (%s) cancelled", job.ID, job.Kind)
+			if cerr := r.store.FinalizeCancelledSidekiqJob(r.baseCtx, job.ID, r.runnerID, finalMetadata); cerr != nil {
+				r.logger.Error("sidekiq: failed to store final progress for cancelled job %s: %v", job.ID, cerr)
+			}
+			return
+		}
 		r.logger.Error("sidekiq: job %s (%s) failed: %v", job.ID, job.Kind, err)
 		if ferr := r.store.FailSidekiqJob(r.baseCtx, job.ID, r.runnerID, finalMetadata, err.Error()); ferr != nil {
+			// Same race as the complete path: a cancel can land while the handler is
+			// returning an unrelated error, in which case the fail is correctly rejected
+			// (the row is no longer running). Honor the cancellation and persist progress.
+			if r.isCancelled(job.ID) {
+				r.logger.Info("sidekiq: job %s (%s) cancelled as it was failing", job.ID, job.Kind)
+				if cerr := r.store.FinalizeCancelledSidekiqJob(r.baseCtx, job.ID, r.runnerID, finalMetadata); cerr != nil {
+					r.logger.Error("sidekiq: failed to store final progress for cancelled job %s: %v", job.ID, cerr)
+				}
+				return
+			}
 			r.logger.Error("sidekiq: failed to mark job %s failed: %v", job.ID, ferr)
 		}
 		return
 	}
 	if cerr := r.store.CompleteSidekiqJob(r.baseCtx, job.ID, r.runnerID, finalMetadata); cerr != nil {
+		// A cancel can land while the handler is finishing its last unit of work, in
+		// which case the complete is correctly rejected (the row is no longer running).
+		// Honor the cancellation rather than reporting a spurious failure.
+		if r.isCancelled(job.ID) {
+			r.logger.Info("sidekiq: job %s (%s) cancelled as it was completing", job.ID, job.Kind)
+			if ferr := r.store.FinalizeCancelledSidekiqJob(r.baseCtx, job.ID, r.runnerID, finalMetadata); ferr != nil {
+				r.logger.Error("sidekiq: failed to store final progress for cancelled job %s: %v", job.ID, ferr)
+			}
+			return
+		}
 		r.logger.Error("sidekiq: failed to mark job %s completed: %v", job.ID, cerr)
 	}
 }
@@ -345,4 +536,23 @@ func (r *Runner) dispatchOnce() {
 func (r *Runner) Shutdown() {
 	r.cancel()
 	r.wg.Wait()
+}
+
+// IsDuplicateJobError reports whether err is a primary-key collision on the job
+// row, i.e. another node enqueued the same deterministic job ID first. Producers
+// that derive the ID from the work itself (an archive window, a scheduled
+// rotation) treat this as "someone else owns it", not as a failure. Matching on
+// message text is the only option: the store surfaces the driver's error
+// verbatim and defines no sentinel for it.
+func IsDuplicateJobError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unique constraint") ||
+		strings.Contains(msg, "unique index") ||
+		strings.Contains(msg, "unique_violation") ||
+		strings.Contains(msg, "duplicate key") ||
+		strings.Contains(msg, "duplicate entry") ||
+		strings.Contains(msg, "duplicated key")
 }

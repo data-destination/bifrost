@@ -3,6 +3,7 @@ package modelcatalog
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
 	"gorm.io/gorm"
 )
 
@@ -25,10 +27,31 @@ const (
 	maxMCPLibraryBodyBytes = 50 << 20         // 50 MiB — hard cap on the catalog payload to prevent OOM
 )
 
+// isFileURL reports whether rawURL points at a local catalog file rather than a
+// remote endpoint. Used to skip network-shaped retry behaviour on the air-gapped
+// path. An unparseable URL is treated as non-file so it still flows into the
+// normal validation and error reporting in fetchMCPLibrary.
+func isFileURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	return err == nil && parsed.Scheme == "file"
+}
+
+// permanentFetchError marks a catalog fetch failure that a retry cannot fix,
+// such as malformed JSON or an HTTP 4xx other than 408 and 429, so withRetries
+// returns it at once. Its message is the wrapped error's.
+type permanentFetchError struct{ err error }
+
+// Error returns the wrapped error's message unchanged.
+func (e *permanentFetchError) Error() string { return e.err.Error() }
+
+// Unwrap exposes the wrapped error to errors.Is and errors.As.
+func (e *permanentFetchError) Unwrap() error { return e.err }
+
 // withRetries runs op up to maxRetries+1 times, waiting with exponential
 // backoff (starting at retryBackoffMin, capped at maxBackoff) between attempts.
-// It returns the first successful result or the last error. The context is
-// honored during both the operation and the backoff waits.
+// It returns the first successful result or the last error; a
+// *permanentFetchError ends the attempts at once. The context is honored during
+// both the operation and the backoff waits.
 func withRetries[T any](ctx context.Context, maxRetries int, maxBackoff time.Duration, op func() (T, error)) (T, error) {
 	var zero T
 	if maxRetries < 0 {
@@ -56,6 +79,9 @@ func withRetries[T any](ctx context.Context, maxRetries int, maxBackoff time.Dur
 		v, err := op()
 		if err == nil {
 			return v, nil
+		}
+		if _, permanent := errors.AsType[*permanentFetchError](err); permanent {
+			return zero, err
 		}
 		lastErr = err
 	}
@@ -102,7 +128,15 @@ func SyncMCPLibrary(ctx context.Context, url string, store configstore.ConfigSto
 		url = DefaultMCPLibraryURL
 	}
 
-	entries, err := withRetries(ctx, urlFetchMaxRetries, urlFetchMaxBackoff, func() ([]MCPLibraryEntry, error) {
+	// A local catalog file either exists or it does not; retrying with backoff
+	// only adds boot latency on an air-gapped host with a bad path. Retries stay
+	// on the network path where a transient failure is plausible.
+	maxRetries := urlFetchMaxRetries
+	if isFileURL(url) {
+		maxRetries = 0
+	}
+
+	entries, err := withRetries(ctx, maxRetries, urlFetchMaxBackoff, func() ([]MCPLibraryEntry, error) {
 		return fetchMCPLibrary(ctx, url)
 	})
 	if err != nil {
@@ -133,6 +167,11 @@ func SyncMCPLibrary(ctx context.Context, url string, store configstore.ConfigSto
 			e := &entries[i]
 			if e.Name == "" {
 				continue // skip malformed entries
+			}
+			// Skip entries the publish API would reject: an unknown connection
+			// or auth type, or a missing URL or stdio command.
+			if ValidateMCPLibraryEntry(e.ConnectionType, e.ConnectionURL, e.StdioConfig, e.AuthType) != nil {
+				continue
 			}
 			// The catalog payload carries no slug; derive it from the name,
 			// matching the slug generation used for custom library entries.
@@ -235,12 +274,15 @@ func (mc *ModelCatalog) getMCPLibraryURL() string {
 func fetchMCPLibrary(ctx context.Context, rawURL string) ([]MCPLibraryEntry, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse MCP library URL: %w", err)
+		return nil, &permanentFetchError{fmt.Errorf("failed to parse MCP library URL: %w", err)}
 	}
 
 	var data []byte
 	if parsed.Scheme == "file" {
-		f, err := os.Open(parsed.Path)
+		// Resolve through the shared datasheet helper so relative
+		// (file://./servers.json) and localhost-host (file://localhost/abs/...)
+		// forms work here exactly as they do for the pricing datasheets.
+		f, err := os.Open(datasheet.FilePathFromURL(parsed))
 		if err != nil {
 			return nil, fmt.Errorf("failed to open MCP library file: %w", err)
 		}
@@ -256,7 +298,7 @@ func fetchMCPLibrary(ctx context.Context, rawURL string) ([]MCPLibraryEntry, err
 		if err := bifrost.ValidateExternalURL(rawURL, true); err != nil {
 			return nil, fmt.Errorf("MCP library URL validation failed: %w", err)
 		}
-		client := &http.Client{Timeout: DefaultMCPLibraryTimeout}
+		client := datasheet.NewHTTPClient(DefaultMCPLibraryTimeout)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create HTTP request: %w", err)
@@ -269,7 +311,12 @@ func fetchMCPLibrary(ctx context.Context, rawURL string) ([]MCPLibraryEntry, err
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("failed to download MCP library data: HTTP %d", resp.StatusCode)
+			err := fmt.Errorf("failed to download MCP library data: HTTP %d", resp.StatusCode)
+			// A 4xx other than 408 and 429 answers the same on a retry.
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
+				return nil, &permanentFetchError{err}
+			}
+			return nil, err
 		}
 
 		data, err = io.ReadAll(io.LimitReader(resp.Body, maxMCPLibraryBodyBytes+1))
@@ -277,16 +324,42 @@ func fetchMCPLibrary(ctx context.Context, rawURL string) ([]MCPLibraryEntry, err
 			return nil, fmt.Errorf("failed to read MCP library response: %w", err)
 		}
 		if int64(len(data)) > maxMCPLibraryBodyBytes {
-			return nil, fmt.Errorf("MCP library response exceeds %d bytes", maxMCPLibraryBodyBytes)
+			return nil, &permanentFetchError{fmt.Errorf("MCP library response exceeds %d bytes", maxMCPLibraryBodyBytes)}
 		}
 	}
 
 	var payload MCPLibraryPayload
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal MCP library data: %w", err)
+		return nil, &permanentFetchError{fmt.Errorf("failed to unmarshal MCP library data: %w", err)}
 	}
 
 	return payload.Servers, nil
+}
+
+// ValidateMCPLibraryEntry applies the connection and auth checks every library
+// entry must pass, whether published through the API or synced from the
+// catalog. An empty authType counts as "none".
+func ValidateMCPLibraryEntry(connectionType schemas.MCPConnectionType, connectionURL string, stdioConfig *schemas.MCPStdioConfig, authType schemas.MCPAuthType) error {
+	switch connectionType {
+	case schemas.MCPConnectionTypeHTTP, schemas.MCPConnectionTypeSSE:
+		if strings.TrimSpace(connectionURL) == "" {
+			return errors.New("connection_url is required for http/sse connection types")
+		}
+	case schemas.MCPConnectionTypeSTDIO:
+		if stdioConfig == nil || strings.TrimSpace(stdioConfig.Command) == "" {
+			return errors.New("stdio_config.command is required for stdio connection type")
+		}
+	default:
+		return errors.New("connection_type must be one of: http, stdio, sse")
+	}
+	switch authType {
+	case "", schemas.MCPAuthTypeNone, schemas.MCPAuthTypeHeaders, schemas.MCPAuthTypeOauth,
+		schemas.MCPAuthTypePerUserOauth, schemas.MCPAuthTypePerUserHeaders,
+		schemas.MCPAuthTypeTokenExchange:
+		return nil
+	default:
+		return errors.New("invalid auth_type")
+	}
 }
 
 // Slugify derives a URL/identifier-safe slug from a display name: lowercase,

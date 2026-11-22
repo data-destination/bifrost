@@ -2,10 +2,17 @@
 
 import { ModelProviderName, RequestType } from "./config";
 
+/** Window settings the reset duration cannot express. Only valid on "1Q". */
+export interface BudgetResetConfig {
+	/** First month of Q1 as 1-12; omitted means January. */
+	quarter_start_month?: number;
+}
+
 export interface Budget {
 	id: string;
 	max_limit: number; // In dollars
-	reset_duration: string; // e.g., "30s", "5m", "1h", "1d", "1w", "1M"
+	reset_duration: string; // e.g., "30s", "5m", "1h", "1d", "1w", "1M", "1Q"
+	reset_config?: BudgetResetConfig;
 	current_usage: number; // In dollars
 	last_reset: string; // ISO timestamp
 	override_amount?: number;
@@ -47,6 +54,10 @@ export interface Team {
 	rate_limit_id?: string;
 	// Team-wide: applies to all team budgets and the team rate limit
 	calendar_aligned?: boolean;
+	// Number of virtual keys assigned to this team (server-computed via a
+	// correlated subquery; the list endpoints report this instead of embedding
+	// the virtual keys themselves)
+	virtual_key_count?: number;
 	// Populated relationships
 	customer?: Customer;
 	budgets?: Budget[]; // Multi-budget: each with a distinct reset_duration
@@ -58,6 +69,11 @@ export interface Customer {
 	name: string;
 	rate_limit_id?: string;
 	calendar_aligned?: boolean;
+	// Number of virtual keys owned by this customer (server-computed; the list
+	// endpoint reports this instead of embedding the virtual keys themselves)
+	virtual_key_count?: number;
+	// Number of teams attached to this customer (server-computed on the list endpoint)
+	team_count?: number;
 	// Populated relationships
 	teams?: Team[];
 	budgets?: Budget[];
@@ -70,6 +86,8 @@ export interface DBKey {
 	provider_id: string; // identifier for the provider
 	models: string[]; // List of models this key can access
 	provider: ModelProviderName; // Provider name
+	// Omitted by the API when unset, which the Go side reads as enabled.
+	enabled?: boolean;
 }
 
 export interface RedactedDBKey {
@@ -86,20 +104,57 @@ export interface VirtualKey {
 	description?: string;
 	provider_configs?: VirtualKeyProviderConfig[];
 	mcp_configs?: VirtualKeyMCPConfig[];
+	agent_grants?: VirtualKeyAgentGrant[];
+	relay_grants?: { relay_name: string }[];
+	// Virtual MCPs this key is assigned to. Populated by the single-VK GET, not the list.
+	virtual_mcp_ids?: number[];
 	team_id?: string;
 	customer_id?: string;
 	rate_limit_id?: string;
 	is_active: boolean;
 	expires_at?: string | null; // ISO 8601 UTC timestamp; null or absent means never expires
+	// Tri-state: absent/null inherits client.delete_expired_virtual_keys, true/false override it.
+	delete_after_expire?: boolean | null;
+	previous_value_expires_at?: string | null; // When set, the pre-rotation value still authenticates until this time
+	rotated_at?: string | null; // Timestamp of the last value rotation
 	calendar_aligned?: boolean;
+	// When true, every provider is allowed; provider_configs remain optional per-provider overrides
+	allow_all_providers?: boolean;
+	// Tri-state: absent/null inherits client.disable_content_logging, true forces content off for
+	// this key's traffic, false forces it on for the log store.
+	disable_content_logging?: boolean | null;
+	// Custom key/value attribution (cost center, owner, ...). Snapshotted onto each log row, so logs
+	// can be filtered by it. Absent when the key has none.
+	metadata?: Record<string, string>;
 	created_at: string;
 	updated_at: string;
+	// The third owner a key can have, alongside a team and a customer. Business units are an
+	// enterprise table this model does not preload, so its name arrives on `business_unit` below.
+	business_unit_id?: string;
 	// Populated relationships
 	team?: Team;
 	customer?: Customer;
+	// Owning business unit, named by the enterprise build; absent in OSS and when unresolved.
+	business_unit?: { id: string; name: string };
 	budgets?: Budget[];
 	rate_limit?: RateLimit;
+	// Read-only, server-computed: true when the VK is governed by an access profile.
+	// Lets the UI lock edits and show the managed-key notice without the separately
+	// RBAC-gated access-profile lookup.
+	is_access_profile_managed?: boolean;
+	// Read-only, server-computed: the user this key is assigned to, or null when it
+	// is assigned to a team, a customer, or nothing. Absent (rather than null) when
+	// the response came from a path that does not resolve assignees, so callers can
+	// tell "unassigned" from "unknown". Always null in OSS, which has no users.
+	assigned_user?: { id: string; name: string; email: string } | null;
 	config_hash?: string; // Present when config is synced from config.json
+}
+
+// Per-model budgets/rate-limits under a provider config, surfaced on the VK for display/edit.
+export interface VirtualKeyModelBudget {
+	model_name: string;
+	budgets?: Budget[];
+	rate_limit?: RateLimit;
 }
 
 export interface VirtualKeyProviderConfig {
@@ -111,7 +166,15 @@ export interface VirtualKeyProviderConfig {
 	allow_all_keys: boolean; // True means all keys allowed; false with empty keys means no keys allowed
 	budgets?: Budget[];
 	rate_limit?: RateLimit;
+	model_budgets?: VirtualKeyModelBudget[]; // Per-model budgets/rate-limits under this provider
 	keys?: DBKey[]; // Associated database keys for this provider (only used when allow_all_keys is false)
+}
+
+/** A virtual key's grant to call one registered A2A agent. Agents are keyed by name. */
+export interface VirtualKeyAgentGrant {
+	virtual_key_id: string;
+	agent_name: string;
+	created_at: string;
 }
 
 export interface VirtualKeyMCPConfig {
@@ -124,6 +187,7 @@ export interface VirtualKeyMCPConfig {
 		connection_type: string;
 		connection_string?: string;
 		tools_to_execute: string[];
+		disabled?: boolean;
 		created_at: string;
 		updated_at: string;
 	};
@@ -147,6 +211,14 @@ export interface UsageStats {
 	requests_last_reset: string;
 }
 
+// One per-model budget/rate-limit group in a provider-config request. model_name must be a
+// concrete model (not the "*" wildcard, which is the provider-level tier).
+export interface VirtualKeyModelBudgetRequest {
+	model_name: string;
+	budgets?: CreateBudgetRequest[];
+	rate_limit?: CreateRateLimitRequest;
+}
+
 // Request interfaces for provider config operations
 export interface VirtualKeyProviderConfigRequest {
 	provider: string;
@@ -155,6 +227,7 @@ export interface VirtualKeyProviderConfigRequest {
 	blacklisted_models?: string[];
 	budgets?: CreateBudgetRequest[];
 	rate_limit?: CreateRateLimitRequest;
+	model_budgets?: VirtualKeyModelBudgetRequest[];
 	key_ids?: string[]; // List of DBKey UUIDs to associate with this provider config
 }
 
@@ -166,6 +239,7 @@ export interface VirtualKeyProviderConfigUpdateRequest {
 	blacklisted_models?: string[];
 	budgets?: CreateBudgetRequest[];
 	rate_limit?: UpdateRateLimitRequest;
+	model_budgets?: VirtualKeyModelBudgetRequest[]; // Full desired per-model set when provider_configs is supplied
 	key_ids?: string[]; // List of DBKey UUIDs to associate with this provider config
 }
 
@@ -175,13 +249,21 @@ export interface CreateVirtualKeyRequest {
 	description?: string;
 	provider_configs?: VirtualKeyProviderConfigRequest[];
 	mcp_configs?: VirtualKeyMCPConfigRequest[];
+	agent_grants?: { agent_name: string }[];
+	relay_grants?: { relay_name: string }[];
 	team_id?: string;
 	customer_id?: string;
+	// Third owner, mutually exclusive with team_id and customer_id (enterprise).
+	business_unit_id?: string;
 	budgets?: CreateBudgetRequest[];
 	rate_limit?: CreateRateLimitRequest;
 	is_active?: boolean;
 	calendar_aligned?: boolean;
+	allow_all_providers?: boolean; // When true, all providers are allowed
 	expires_at?: string; // RFC3339 UTC timestamp; omit for a key that never expires
+	disable_content_logging?: boolean; // Omit to inherit the client setting; true forces content off, false forces it on
+	metadata?: Record<string, string>; // Custom key/value attribution; omit for none
+	delete_after_expire?: boolean; // Omit to inherit client.delete_expired_virtual_keys; true/false override it; requires expires_at
 }
 
 export interface UpdateVirtualKeyRequest {
@@ -189,14 +271,22 @@ export interface UpdateVirtualKeyRequest {
 	description?: string;
 	provider_configs?: VirtualKeyProviderConfigUpdateRequest[];
 	mcp_configs?: VirtualKeyMCPConfigRequest[];
+	agent_grants?: { agent_name: string }[];
+	relay_grants?: { relay_name: string }[];
 	team_id?: string | null;
 	customer_id?: string | null;
+	// Third owner, mutually exclusive with team_id and customer_id (enterprise); null clears it.
+	business_unit_id?: string | null;
 	budgets?: CreateBudgetRequest[];
 	rate_limit?: UpdateRateLimitRequest;
 	is_active?: boolean;
 	calendar_aligned?: boolean;
+	allow_all_providers?: boolean; // When true, all providers are allowed; omit to leave unchanged
 	reset_budget_usage?: boolean;
 	expires_at?: string; // RFC3339 UTC timestamp sets a new expiry, "" clears it, omit to leave unchanged
+	disable_content_logging?: boolean | null; // null clears back to inherit, true/false set it, omit to leave unchanged
+	metadata?: Record<string, string>; // Replaces the metadata as a whole: {} clears it, omit to leave unchanged
+	delete_after_expire?: boolean | null; // null clears back to inherit, true/false set it, omit to leave unchanged; a value requires an expiry
 }
 
 export interface BulkRotateVirtualKeysRequest {
@@ -223,6 +313,8 @@ export interface UpdateTeamRequest {
 	budgets?: CreateBudgetRequest[]; // Replaces all team budgets; empty array clears
 	rate_limit?: UpdateRateLimitRequest;
 	calendar_aligned?: boolean;
+	/** Zero current usage on the reconciled budgets. The reset window is unchanged. */
+	reset_budget_usage?: boolean;
 }
 
 export interface CreateCustomerRequest {
@@ -239,17 +331,21 @@ export interface UpdateCustomerRequest {
 	budget?: UpdateBudgetRequest; // deprecated: use budgets
 	rate_limit?: UpdateRateLimitRequest;
 	calendar_aligned?: boolean;
+	/** Zero current usage on the reconciled budgets. The reset window is unchanged. */
+	reset_budget_usage?: boolean;
 }
 
 export interface CreateBudgetRequest {
 	id?: string;
 	max_limit: number; // In dollars
-	reset_duration: string; // e.g., "30s", "5m", "1h", "1d", "1w", "1M"
+	reset_duration: string; // e.g., "30s", "5m", "1h", "1d", "1w", "1M", "1Q"
+	reset_config?: BudgetResetConfig;
 }
 
 export interface UpdateBudgetRequest {
 	max_limit?: number;
 	reset_duration?: string;
+	reset_config?: BudgetResetConfig;
 }
 
 export interface CreateRateLimitRequest {
@@ -279,12 +375,18 @@ export interface GetVirtualKeysParams {
 	search?: string;
 	customer_id?: string;
 	team_id?: string;
+	/** Enterprise-only owner kind; a key names at most one owner, so this ORs with the other two. */
+	business_unit_id?: string;
+	/** Enterprise-only: filters to virtual keys assigned to this user. */
+	user_id?: string;
 	exclude_access_profile_managed_virtual?: boolean;
 	exclude_assigned_virtual_keys?: boolean;
 	for_user_assignment?: boolean;
 	sort_by?: "name" | "budget_spent" | "created_at" | "status";
 	order?: "asc" | "desc";
 	export?: boolean;
+	/** Exact-match metadata filters, sent as metadata_<key>=<value> and AND-ed server-side. */
+	metadata?: Record<string, string>;
 }
 
 // Response types
@@ -375,6 +477,12 @@ export interface ModelConfig {
 	scope?: string; // "global" (default) or "virtual_key"
 	scope_id?: string; // Target of a non-global scope (e.g. the virtual key ID)
 	scope_name?: string; // Resolved, human-readable name of the scope target (read-only)
+	// What externally manages this config, e.g. the access profile that materialized
+	// it (read-only). source_id addresses the SOURCE, not scope_id — for an
+	// access-profile-scoped row scope_id is the user's association row.
+	source_type?: string;
+	source_id?: string;
+	source_name?: string;
 	calendar_aligned?: boolean; // Snap budget resets to calendar boundaries (inherited from VK for vk scope)
 	rate_limit_id?: string;
 	// Populated relationships
@@ -400,6 +508,8 @@ export interface UpdateModelConfigRequest {
 	provider?: string; // Optional provider - if empty/null, applies to all providers
 	budgets?: CreateBudgetRequest[]; // Full desired set; reconciled against existing
 	rate_limit?: UpdateRateLimitRequest;
+	/** Zero current usage on the reconciled budgets. The reset window is unchanged. */
+	reset_budget_usage?: boolean;
 }
 
 export interface GetModelConfigsParams {
@@ -426,7 +536,10 @@ export type PricingOverrideScopeKind =
 	| "provider_key"
 	| "virtual_key"
 	| "virtual_key_provider"
-	| "virtual_key_provider_key";
+	| "virtual_key_provider_key"
+	| "user"
+	| "user_provider"
+	| "user_provider_key";
 export type PricingOverrideMatchType = "exact" | "wildcard";
 
 export interface PricingOverridePatch {
@@ -437,8 +550,12 @@ export interface PricingOverridePatch {
 	output_cost_per_token_batches?: number;
 	input_cost_per_token_priority?: number;
 	output_cost_per_token_priority?: number;
+	input_cost_per_token_ultrafast?: number;
+	output_cost_per_token_ultrafast?: number;
 	input_cost_per_token_flex?: number;
 	output_cost_per_token_flex?: number;
+	input_cost_per_token_decisions?: number;
+	output_cost_per_token_decisions?: number;
 	input_cost_per_character?: number;
 	input_cost_per_token_fast?: number;
 	output_cost_per_token_fast?: number;
@@ -448,6 +565,9 @@ export interface PricingOverridePatch {
 	input_cost_per_image_above_128k_tokens?: number;
 	input_cost_per_video_per_second_above_128k_tokens?: number;
 	input_cost_per_audio_per_second_above_128k_tokens?: number;
+	// 100k tier
+	input_cost_per_token_above_100k_tokens?: number;
+	output_cost_per_token_above_100k_tokens?: number;
 	// 200k tier
 	input_cost_per_token_above_200k_tokens?: number;
 	input_cost_per_token_above_200k_tokens_priority?: number;
@@ -460,6 +580,8 @@ export interface PricingOverridePatch {
 	output_cost_per_token_above_272k_tokens?: number;
 	output_cost_per_token_above_272k_tokens_priority?: number;
 	output_cost_per_token_flex_above_272k_tokens?: number;
+	input_cost_per_token_above_272k_tokens_ultrafast?: number;
+	output_cost_per_token_above_272k_tokens_ultrafast?: number;
 	// Cache
 	cache_creation_input_token_cost?: number;
 	cache_read_input_token_cost?: number;
@@ -468,19 +590,35 @@ export interface PricingOverridePatch {
 	cache_read_input_token_cost_above_200k_tokens_priority?: number;
 	cache_creation_input_token_cost_above_1hr?: number;
 	cache_creation_input_token_cost_above_1hr_above_200k_tokens?: number;
+	cache_creation_input_token_cost_above_100k_tokens?: number;
+	cache_read_input_token_cost_above_100k_tokens?: number;
+	cache_creation_input_token_cost_above_1hr_above_100k_tokens?: number;
 	cache_creation_input_audio_token_cost?: number;
 	cache_read_input_token_cost_priority?: number;
+	cache_read_input_token_cost_ultrafast?: number;
 	cache_read_input_token_cost_flex?: number;
 	cache_read_input_image_token_cost?: number;
 	cache_read_input_token_cost_above_272k_tokens?: number;
 	cache_read_input_token_cost_above_272k_tokens_priority?: number;
 	cache_read_input_token_cost_flex_above_272k_tokens?: number;
+	cache_read_input_token_cost_above_272k_tokens_ultrafast?: number;
 	cache_creation_input_token_cost_above_272k_tokens?: number;
 	cache_creation_input_token_cost_flex?: number;
 	cache_creation_input_token_cost_flex_above_272k_tokens?: number;
+	cache_creation_input_token_cost_above_272k_tokens_ultrafast?: number;
 	cache_creation_input_token_cost_priority?: number;
+	cache_creation_input_token_cost_above_272k_tokens_priority?: number;
+	cache_creation_input_token_cost_ultrafast?: number;
 	cache_creation_input_token_cost_fast?: number;
 	cache_creation_input_token_cost_above_1hr_fast?: number;
+	cache_creation_input_token_cost_above_12hr?: number;
+	cache_creation_input_token_cost_above_12hr_above_272k_tokens?: number;
+	cache_creation_input_token_cost_above_12hr_priority?: number;
+	cache_creation_input_token_cost_above_12hr_above_272k_tokens_priority?: number;
+	cache_creation_input_token_cost_above_12hr_flex?: number;
+	cache_creation_input_token_cost_above_12hr_above_272k_tokens_flex?: number;
+	cache_creation_input_token_cost_above_12hr_ultrafast?: number;
+	cache_creation_input_token_cost_above_12hr_above_272k_tokens_ultrafast?: number;
 	cache_read_input_token_cost_fast?: number;
 	// Image
 	input_cost_per_image_token?: number;
@@ -494,10 +632,31 @@ export interface PricingOverridePatch {
 	output_cost_per_image_above_512_and_512_pixels_and_premium_image?: number;
 	output_cost_per_image_above_1024_and_1024_pixels?: number;
 	output_cost_per_image_above_1024_and_1024_pixels_and_premium_image?: number;
+	output_cost_per_image_above_1024_and_1536_pixels?: number;
+	output_cost_per_image_above_1536_and_1024_pixels?: number;
+	output_cost_per_image_above_2048_and_2048_pixels?: number;
+	output_cost_per_image_above_4096_and_4096_pixels?: number;
+	output_cost_per_image_above_4_megapixels?: number;
+	output_cost_per_image_above_8_megapixels?: number;
+	output_cost_per_image_above_16_megapixels?: number;
+	output_cost_per_image_above_32_megapixels?: number;
+	output_cost_per_image_above_64_megapixels?: number;
 	output_cost_per_image_low_quality?: number;
 	output_cost_per_image_medium_quality?: number;
 	output_cost_per_image_high_quality?: number;
 	output_cost_per_image_auto_quality?: number;
+	output_cost_per_image_above_1024_and_1024_pixels_low_quality?: number;
+	output_cost_per_image_above_1024_and_1536_pixels_low_quality?: number;
+	output_cost_per_image_above_1536_and_1024_pixels_low_quality?: number;
+	output_cost_per_image_above_1024_and_1024_pixels_medium_quality?: number;
+	output_cost_per_image_above_1024_and_1536_pixels_medium_quality?: number;
+	output_cost_per_image_above_1536_and_1024_pixels_medium_quality?: number;
+	output_cost_per_image_above_1024_and_1024_pixels_high_quality?: number;
+	output_cost_per_image_above_1024_and_1536_pixels_high_quality?: number;
+	output_cost_per_image_above_1536_and_1024_pixels_high_quality?: number;
+	output_cost_per_image_above_1024_and_1024_pixels_standard_quality?: number;
+	output_cost_per_image_above_1024_and_1536_pixels_standard_quality?: number;
+	output_cost_per_image_above_1536_and_1024_pixels_standard_quality?: number;
 	// Audio/Video
 	input_cost_per_audio_token?: number;
 	input_cost_per_audio_per_second?: number;
@@ -506,19 +665,61 @@ export interface PricingOverridePatch {
 	output_cost_per_audio_token?: number;
 	output_cost_per_video_per_second?: number;
 	output_cost_per_second?: number;
+	output_cost_per_video_per_second_480p?: number;
+	output_cost_per_video_per_second_720p?: number;
+	output_cost_per_video_per_second_1024p?: number;
+	output_cost_per_video_per_second_1080p?: number;
+	output_cost_per_video_per_second_4k?: number;
+	output_cost_per_video_token?: number;
+	// Azure Voice Live
+	input_cost_per_token_voice_live?: number;
+	output_cost_per_token_voice_live?: number;
+	cache_read_input_token_cost_voice_live?: number;
+	input_cost_per_audio_token_voice_live?: number;
+	output_cost_per_audio_token_voice_live?: number;
+	input_cost_per_standard_speech_audio_token_voice_live?: number;
+	output_cost_per_standard_speech_audio_token_voice_live?: number;
+	input_cost_per_custom_speech_audio_token_voice_live?: number;
+	output_cost_per_custom_speech_audio_token_voice_live?: number;
 	// Other
-	search_context_cost_per_query?: number;
+	web_search_cost_per_request?: number;
+	input_cost_per_query?: number;
 	code_interpreter_cost_per_session?: number;
 	inference_geo_us_multiplier?: number;
+	cost_per_request?: number;
 	// OCR
 	ocr_cost_per_page?: number;
 	annotation_cost_per_page?: number;
+	// Time of day
+	off_peak_cost_multiplier?: number;
+	peak_hours?: PeakHoursSchedule;
+}
+
+/**
+ * Recurring weekly windows during which a model is billed at its peak (base)
+ * rates. Any instant outside every window is off-peak and is discounted by
+ * `off_peak_cost_multiplier`.
+ */
+export interface PeakHoursSchedule {
+	/** IANA location name (e.g. "UTC", "Asia/Shanghai"). Empty means UTC. */
+	timezone?: string;
+	windows?: PeakHoursWindow[];
+}
+
+export interface PeakHoursWindow {
+	/** Weekdays, 0 = Sunday through 6 = Saturday. */
+	days: number[];
+	/** "HH:MM" in the schedule's timezone, inclusive. */
+	start: string;
+	/** "HH:MM" in the schedule's timezone, exclusive; <= start wraps midnight. */
+	end: string;
 }
 
 export interface PricingOverride {
 	id: string;
 	name: string;
 	scope_kind: PricingOverrideScopeKind;
+	user_id?: string;
 	virtual_key_id?: string;
 	provider_id?: string;
 	provider_key_id?: string;
@@ -534,6 +735,7 @@ export interface PricingOverride {
 export interface CreatePricingOverrideRequest {
 	name: string;
 	scope_kind: PricingOverrideScopeKind;
+	user_id?: string;
 	virtual_key_id?: string;
 	provider_id?: string;
 	provider_key_id?: string;
@@ -546,6 +748,7 @@ export interface CreatePricingOverrideRequest {
 export interface UpdatePricingOverrideRequest {
 	name?: string;
 	scope_kind?: PricingOverrideScopeKind;
+	user_id?: string;
 	virtual_key_id?: string;
 	provider_id?: string;
 	provider_key_id?: string;
@@ -576,6 +779,8 @@ export interface UpdateProviderGovernanceRequest {
 	budgets?: CreateBudgetRequest[]; // [] = remove all
 	rate_limit?: UpdateRateLimitRequest;
 	calendar_aligned?: boolean;
+	/** Zero current usage on the reconciled budgets. The reset window is unchanged. */
+	reset_budget_usage?: boolean;
 }
 
 export interface GetProviderGovernanceResponse {

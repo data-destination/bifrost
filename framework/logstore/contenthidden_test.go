@@ -28,6 +28,9 @@ func newContentHiddenTestEntry(id string) *Log {
 		OutputMessageParsed: &schemas.ChatMessage{
 			Content: &schemas.ChatMessageContent{ContentStr: strPtr("sensitive answer")},
 		},
+		EmbeddingInputParsed: []schemas.EmbeddingInputItem{
+			{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: strPtr("sensitive embedding")}}},
+		},
 	}
 }
 
@@ -38,20 +41,29 @@ func TestHybrid_ContentHiddenStripsDBRowAndSkipsHydration(t *testing.T) {
 
 	entry := newContentHiddenTestEntry("hidden-1")
 	entry.ContentHidden = true
+	entry.TokenUsageParsed = billingTestUsage()
 	require.NoError(t, entry.SerializeFields())
 
 	require.NoError(t, hybrid.CreateIfNotExists(ctx, entry))
-	waitForUploads(t, func() bool { return objStore.Len() == 1 })
+	// Wait for the has_object flag, not just the object: processUpload writes the
+	// flag after the Put, so waiting on objStore.Len() alone races the assertion
+	// below under parallel load.
+	waitForOffload(t, inner, "hidden-1")
+	require.Equal(t, 1, objStore.Len())
 
-	// The DB row must hold no content at all: no payload fields, no summary,
-	// no last-user-message preview.
+	// The DB row must hold no request/response content: no content payload fields,
+	// summary, or last-user-message preview. Pricing metadata is not content and
+	// remains DB-resident.
 	dbRow, err := inner.FindByID(ctx, "hidden-1")
 	require.NoError(t, err)
 	assert.True(t, dbRow.ContentHidden)
 	assert.True(t, dbRow.HasObject)
 	assert.Empty(t, dbRow.InputHistory)
 	assert.Empty(t, dbRow.OutputMessage)
+	assert.Empty(t, dbRow.EmbeddingInput)
 	assert.Empty(t, dbRow.ContentSummary)
+	assert.NotEmpty(t, dbRow.TokenUsage)
+	require.NotNil(t, dbRow.TokenUsageParsed)
 
 	// The full payload must be in object storage.
 	data, err := objStore.Get(ctx, ObjectKey("test", entry.Timestamp, "hidden-1"))
@@ -67,6 +79,8 @@ func TestHybrid_ContentHiddenStripsDBRowAndSkipsHydration(t *testing.T) {
 	assert.True(t, found.ContentHidden)
 	assert.Empty(t, found.InputHistory, "hidden log must not be hydrated")
 	assert.Empty(t, found.OutputMessage, "hidden log must not be hydrated")
+	assert.Empty(t, found.EmbeddingInput, "hidden log must not be hydrated")
+	assert.Nil(t, found.EmbeddingInputParsed, "hidden log must not be hydrated")
 	assert.Empty(t, found.ContentSummary)
 }
 
@@ -76,7 +90,7 @@ func TestHybrid_ContentHiddenIgnoresExclusionList(t *testing.T) {
 	require.NoError(t, err)
 	objStore := objectstore.NewInMemoryObjectStore()
 	// params is configured to stay DB-resident and out of the object payload.
-	hybrid := newHybridLogStore(inner, objStore, "test", hybridTestLogger{}, []string{"params"})
+	hybrid := newHybridLogStore(inner, objStore, "test", hybridTestLogger{}, []string{"params"}, nil)
 	defer hybrid.Close(ctx)
 
 	normal := newContentHiddenTestEntry("normal-1")
@@ -127,6 +141,9 @@ func TestHybrid_ContentHiddenBatchMixed(t *testing.T) {
 
 	require.NoError(t, hybrid.BatchCreateIfNotExists(ctx, []*Log{visibleEntry, hiddenEntry}))
 	waitForUploads(t, func() bool { return objStore.Len() == 2 })
+	// The hydration assertion below needs the visible row's has_object flag,
+	// which processUpload commits only after the object Put.
+	waitForOffload(t, inner, "batch-visible")
 
 	visibleRow, err := inner.FindByID(ctx, "batch-visible")
 	require.NoError(t, err)

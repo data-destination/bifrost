@@ -1,3 +1,6 @@
+import { CalendarAlignmentNotice } from "@/components/calendarAlignmentNotice";
+import { calendarWindowDurations, isMultiUnitDuration } from "@/lib/constants/governance";
+import { CustomerSelector } from "@/components/entitySelectors/customerSelector";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -8,30 +11,35 @@ import {
 	AlertDialogHeader,
 	AlertDialogTitle,
 } from "@/components/ui/alertDialog";
+import { CopyableId } from "@/components/copyableId";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import NumberAndSelect from "@/components/ui/numberAndSelect";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { resetDurationOptions, supportsCalendarAlignment } from "@/lib/constants/governance";
+import BudgetUsageResetDialog from "@/components/ui/budgetUsageResetDialog";
+import { useBudgetUsageResetPrompt } from "@/hooks/useBudgetUsageResetPrompt";
+import QuarterStartSelect from "@/components/ui/quarterStartSelect";
+import { budgetResetDurationOptions, resetDurationOptions, supportsCalendarAlignment } from "@/lib/constants/governance";
 import { getErrorMessage, useCreateTeamMutation, useUpdateTeamMutation } from "@/lib/store";
-import { CreateTeamRequest, Customer, Team, UpdateTeamRequest } from "@/lib/types/governance";
-import { formatCurrency } from "@/lib/utils/governance";
+import { CreateTeamRequest, Team, UpdateTeamRequest } from "@/lib/types/governance";
+import { budgetSignature, formatCurrency } from "@/lib/utils/governance";
 import { Validator } from "@/lib/utils/validation";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { formatDistanceToNow } from "date-fns";
+import { dateFnsLocale } from "@/lib/i18n/dateLocale";
 import isEqual from "lodash.isequal";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Trans, useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { v4 as uuid } from "uuid";
+import { getLocale } from "@/lib/i18n";
 
 interface TeamSheetProps {
 	team?: Team | null;
-	customers: Customer[];
 	onSave: () => void;
 	onCancel: () => void;
 }
@@ -45,6 +53,8 @@ interface TeamBudgetRow {
 	id: string;
 	maxLimit: number | undefined;
 	resetDuration: string;
+	/** Fiscal quarter definition; only meaningful when resetDuration is quarterly. */
+	resetConfig?: { quarter_start_month?: number };
 }
 
 interface TeamFormData {
@@ -72,6 +82,7 @@ const createInitialState = (team?: Team | null): Omit<TeamFormData, "isDirty"> =
 				id: b.id,
 				maxLimit: b.max_limit,
 				resetDuration: b.reset_duration,
+				resetConfig: b.reset_config,
 			})) ?? [],
 		// Rate Limit
 		tokenMaxLimit: team?.rate_limit?.token_max_limit ?? undefined,
@@ -82,7 +93,9 @@ const createInitialState = (team?: Team | null): Omit<TeamFormData, "isDirty"> =
 	};
 };
 
-export default function TeamSheet({ team, customers, onSave, onCancel }: TeamSheetProps) {
+export default function TeamSheet({ team, onSave, onCancel }: TeamSheetProps) {
+	const { t, i18n } = useTranslation("governance");
+	const { t: tCommon } = useTranslation("common");
 	const isEditing = !!team;
 	const [initialState, setInitialState] = useState<Omit<TeamFormData, "isDirty">>(createInitialState(team));
 	const [formData, setFormData] = useState<TeamFormData>({
@@ -91,7 +104,14 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 	});
 	const [nameError, setNameError] = useState<string | null>(null);
 
+	// Keyed on the team *id*, not the object: this sheet is fed from a polled
+	// list, so an unchanged team still arrives as a fresh object every few
+	// seconds and an identity-keyed reset would discard in-progress edits.
+	const seededTeamIdRef = useRef<string | null | undefined>(undefined);
 	useEffect(() => {
+		const teamId = team?.id ?? null;
+		if (seededTeamIdRef.current === teamId) return;
+		seededTeamIdRef.current = teamId;
 		const nextInitial = createInitialState(team);
 		setInitialState(nextInitial);
 		setFormData({ ...nextInitial, isDirty: false });
@@ -111,6 +131,10 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 	// Team-wide calendar-align toggle: confirmation only fires on the off→on
 	// transition for an existing team (mirrors the VK sheet behavior).
 	const [showCalendarAlignWarning, setShowCalendarAlignWarning] = useState(false);
+	// Defers the save until the operator says whether to clear accumulated spend.
+	// The payload is a marker rather than the form data: this sheet keeps its own
+	// formData state, which the save reads directly.
+	const resetPrompt = useBudgetUsageResetPrompt<boolean>();
 
 	const updateBudgetRow = (idx: number, patch: Partial<TeamBudgetRow>) => {
 		setFormData((prev) => {
@@ -139,6 +163,35 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 			budgets: prev.budgets.filter((_, i) => i !== idx),
 		}));
 	};
+
+	// Whether anything on the form can align to a calendar: a filled budget or rate limit on a window
+	// with a calendar boundary. The toggle is shown only then.
+	const canCalendarAlign = useMemo(() => {
+		const hasAlignableBudget = formData.budgets.some(
+			(b) =>
+				b.maxLimit !== undefined &&
+				b.maxLimit !== null &&
+				(supportsCalendarAlignment(b.resetDuration) || isMultiUnitDuration(b.resetDuration)),
+		);
+		const hasAlignableRateLimit =
+			(formData.tokenMaxLimit !== undefined &&
+				formData.tokenMaxLimit !== null &&
+				(supportsCalendarAlignment(formData.tokenResetDuration) || isMultiUnitDuration(formData.tokenResetDuration))) ||
+			(formData.requestMaxLimit !== undefined &&
+				formData.requestMaxLimit !== null &&
+				(supportsCalendarAlignment(formData.requestResetDuration) || isMultiUnitDuration(formData.requestResetDuration)));
+		return hasAlignableBudget || hasAlignableRateLimit;
+	}, [formData.budgets, formData.tokenMaxLimit, formData.tokenResetDuration, formData.requestMaxLimit, formData.requestResetDuration]);
+
+	// With nothing left that can align, the team is not calendar aligned in any meaningful sense, so
+	// the hidden toggle is turned off rather than left to submit calendar_aligned: true - the same as
+	// the customer and virtual key sheets do.
+	useEffect(() => {
+		if (formData.calendarAligned && !canCalendarAlign) {
+			updateField("calendarAligned", false);
+		}
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [canCalendarAlign, formData.calendarAligned]);
 
 	const handleCalendarAlignedChange = (checked: boolean) => {
 		// Warn only on the persisted false→true transition. Toggling off then
@@ -188,42 +241,62 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 		const budgetValidators = formData.budgets.flatMap((row, idx) => {
 			if (row.maxLimit === undefined || row.maxLimit === null) return [];
 			return [
-				Validator.minValue(row.maxLimit, 0.01, `Budget #${idx + 1} max limit must be greater than $0.01`),
-				Validator.required(row.resetDuration, `Budget #${idx + 1} reset duration is required`),
+				Validator.minValue(row.maxLimit, 0.01, t("sheet.budgetNMaxLimit", { n: idx + 1 })),
+				Validator.required(row.resetDuration, t("sheet.budgetNResetRequired", { n: idx + 1 })),
 			];
 		});
 		const populatedDurations = formData.budgets.filter((r) => r.maxLimit !== undefined && r.maxLimit !== null).map((r) => r.resetDuration);
 		const uniqueDurations = new Set(populatedDurations).size;
 
 		return new Validator([
-			Validator.required(formData.name.trim(), "Team name is required"),
-			Validator.custom(formData.isDirty, "No changes to save"),
+			Validator.required(formData.name.trim(), t("teams.nameRequired")),
+			Validator.custom(formData.isDirty, t("sheet.noChanges")),
 			...budgetValidators,
-			Validator.custom(uniqueDurations === populatedDurations.length, "Each budget must have a distinct reset duration"),
+			Validator.custom(uniqueDurations === populatedDurations.length, t("sheet.distinctResetDuration")),
 
 			// Rate limit validation - token limits
 			...(formData.tokenMaxLimit !== undefined && formData.tokenMaxLimit !== null
 				? [
-						Validator.minValue(tokenMaxLimitNum || 0, 1, "Token max limit must be at least 1"),
-						Validator.required(formData.tokenResetDuration, "Token reset duration is required"),
+						Validator.minValue(tokenMaxLimitNum || 0, 1, t("sheet.tokenMaxLimit")),
+						Validator.required(formData.tokenResetDuration, t("sheet.tokenResetRequired")),
 					]
 				: []),
 
 			// Rate limit validation - request limits
 			...(formData.requestMaxLimit !== undefined && formData.requestMaxLimit !== null
 				? [
-						Validator.minValue(requestMaxLimitNum || 0, 1, "Request max limit must be at least 1"),
-						Validator.required(formData.requestResetDuration, "Request reset duration is required"),
+						Validator.minValue(requestMaxLimitNum || 0, 1, t("sheet.requestMaxLimit")),
+						Validator.required(formData.requestResetDuration, t("sheet.requestResetRequired")),
 					]
 				: []),
 		]);
-	}, [formData, tokenMaxLimitNum, requestMaxLimitNum]);
+	}, [formData, tokenMaxLimitNum, requestMaxLimitNum, t]);
 
 	const updateField = <K extends keyof TeamFormData>(field: K, value: TeamFormData[K]) => {
 		if (field === "name") {
 			setNameError(null);
 		}
 		setFormData((prev) => ({ ...prev, [field]: value }));
+	};
+
+	// Whether this save changes budget configuration on an existing team, which is
+	// when clearing accumulated spend is a meaningful choice. Creating a team has
+	// no usage to reset, and a save that leaves budgets alone should not ask.
+	// Compared without ids on purpose: form rows carry none while persisted rows do,
+	// so including them would report a change on every save. The shared signature
+	// folds in the fiscal quarter, which a limit-and-duration comparison misses -
+	// moving Q1 from April to July reschedules the reset without touching either.
+	const budgetsChanged = () => {
+		if (!isEditing || !team) return false;
+		const next = formData.budgets
+			.filter((r) => r.maxLimit !== undefined && r.maxLimit !== null)
+			.map((r) => ({ max_limit: r.maxLimit, reset_duration: r.resetDuration, reset_config: r.resetConfig }));
+		const current = (team.budgets ?? []).map((b) => ({
+			max_limit: b.max_limit ?? undefined,
+			reset_duration: b.reset_duration,
+			reset_config: b.reset_config,
+		}));
+		return budgetSignature(next) !== budgetSignature(current);
 	};
 
 	const handleSubmit = async (e: React.FormEvent) => {
@@ -234,13 +307,24 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 			return;
 		}
 
+		if (budgetsChanged()) {
+			resetPrompt.ask(true);
+			return;
+		}
+		await saveTeam(false);
+	};
+
+	const saveTeam = async (resetBudgetUsage: boolean) => {
 		// Serialize budget rows whose max_limit was filled in — rows left blank
 		// are silently dropped (the backend treats the slice as authoritative).
 		const submittableBudgets = formData.budgets
 			.filter((r) => r.maxLimit !== undefined && r.maxLimit !== null)
 			.map((r) => ({
+				id: team?.budgets?.some((budget) => budget.id === r.id) ? r.id : undefined,
 				max_limit: r.maxLimit as number,
 				reset_duration: r.resetDuration,
+				// Only quarterly windows may carry a quarter definition; the API rejects it elsewhere.
+				reset_config: r.resetDuration.endsWith("Q") ? r.resetConfig : undefined,
 			}));
 
 		try {
@@ -253,6 +337,8 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 					budgets: submittableBudgets,
 					// Team-wide setting that governs both team budgets and the team rate limit.
 					calendar_aligned: formData.calendarAligned,
+					// Only sent when the operator explicitly chose to clear spend.
+					reset_budget_usage: resetBudgetUsage || undefined,
 				};
 
 				// Detect rate limit changes using had/has pattern
@@ -273,7 +359,7 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 				}
 
 				await updateTeam({ teamId: team.id, data: updateData }).unwrap();
-				toast.success("Team updated successfully");
+				toast.success(t("teams.updated"));
 			} else {
 				// Create new team
 				const createData: CreateTeamRequest = {
@@ -299,7 +385,7 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 				}
 
 				await createTeam(createData).unwrap();
-				toast.success("Team created successfully");
+				toast.success(t("teams.created"));
 			}
 
 			onSave();
@@ -320,22 +406,23 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 				onInteractOutside={(e) => e.preventDefault()}
 				onEscapeKeyDown={() => onCancel()}
 			>
-				<SheetHeader className="flex flex-col items-start px-0 py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-8">
-					<SheetTitle className="flex items-center gap-2">{isEditing ? "Edit Team" : "Create Team"}</SheetTitle>
-					<SheetDescription>
-						{isEditing ? "Update the team information and settings." : "Create a new team to organize users and manage shared resources."}
-					</SheetDescription>
+				<SheetHeader className="flex flex-col items-start px-0 py-4" headerClassName="mb-0 sticky -top-4 bg-card z-10 px-4 md:px-8">
+					<SheetTitle className="flex items-center gap-2">
+						{isEditing ? t("teams.sheet.editTitle") : t("teams.sheet.createTitle")}
+						{team?.id && <CopyableId id={team.id} entityLabel="Team" />}
+					</SheetTitle>
+					<SheetDescription>{isEditing ? t("teams.sheet.editDescription") : t("teams.sheet.createDescription")}</SheetDescription>
 				</SheetHeader>
 
 				<form onSubmit={handleSubmit} className="flex h-full flex-col gap-6">
-					<div className="grow space-y-6 px-8">
+					<div className="grow space-y-6 px-4 md:px-8">
 						{/* Basic Information */}
 						<div className="flex flex-col gap-6">
 							<div className="space-y-2">
-								<Label htmlFor="name">Team Name *</Label>
+								<Label htmlFor="name">{t("teams.sheet.nameStar")}</Label>
 								<Input
 									id="name"
-									placeholder="e.g., Engineering Team"
+									placeholder={t("teams.sheet.namePlaceholder")}
 									value={formData.name}
 									maxLength={50}
 									onChange={(e) => updateField("name", e.target.value)}
@@ -344,61 +431,74 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 								{nameError && <p className="text-destructive text-sm">{nameError}</p>}
 							</div>
 
-							{/* Customer Assignment */}
-							{customers?.length > 0 && (
-								<div className="space-y-2">
-									<Label htmlFor="customer">Customer (optional)</Label>
-									<Select
-										value={formData.customerId || "__none__"}
-										onValueChange={(value) => updateField("customerId", value === "__none__" ? "" : value)}
-									>
-										<SelectTrigger id="customer" className="w-full" data-testid="team-customer-select-trigger">
-											<SelectValue placeholder="Select a customer" />
-										</SelectTrigger>
-										<SelectContent>
-											<SelectItem value="__none__" data-testid="team-customer-option-none">
-												None
-											</SelectItem>
-											{customers.map((customer) => (
-												<SelectItem key={customer.id} value={customer.id} data-testid={`team-customer-option-${customer.id}`}>
-													{customer.name}
-												</SelectItem>
-											))}
-										</SelectContent>
-									</Select>
-									<p className="text-muted-foreground text-sm">Assign to a customer or leave independent.</p>
+							{/* Customer Assignment — searchable/paginated, so the sheet never
+							    depends on the caller having fetched every customer up front. */}
+							<div className="space-y-2">
+								<Label htmlFor="customer">{t("teams.sheet.customerOptional")}</Label>
+								<div className="flex items-center gap-2" data-testid="team-customer-selector">
+									<CustomerSelector
+										value={formData.customerId}
+										onChange={(value) => updateField("customerId", value)}
+										// The team row embeds its customer, so an existing assignment
+										// renders a name instead of a raw UUID before any fetch.
+										fallbackOption={
+											team?.customer_id
+												? {
+														value: team.customer_id,
+														label: team.customer?.name ?? team.customer_id,
+													}
+												: null
+										}
+										className="min-w-0 flex-1"
+									/>
+									{formData.customerId && (
+										<Button
+											type="button"
+											variant="ghost"
+											size="sm"
+											onClick={() => updateField("customerId", "")}
+											data-testid="team-customer-clear-btn"
+										>
+											{t("sheet.clear")}
+										</Button>
+									)}
 								</div>
-							)}
+								<p className="text-muted-foreground text-sm">{t("teams.sheet.customerHelp")}</p>
+							</div>
 						</div>
 
 						{/* Multi-budget configuration: one row per budget, each keyed by reset_duration */}
 						<div className="space-y-3">
 							<div className="flex items-center justify-between">
-								<Label>Budgets</Label>
+								<Label>{t("sheet.budgets")}</Label>
 								<button
 									type="button"
 									onClick={addBudgetRow}
 									className="text-primary text-xs font-medium hover:underline"
 									data-testid="team-add-budget-btn"
 								>
-									+ Add budget
+									{t("sheet.addBudget")}
 								</button>
 							</div>
-							{formData.budgets.length === 0 && (
-								<p className="text-muted-foreground text-xs">No budgets. Click "Add budget" to enforce a spend limit.</p>
-							)}
+							{formData.budgets.length === 0 && <p className="text-muted-foreground text-xs">{t("sheet.noBudgets")}</p>}
 							{formData.budgets.map((row, idx) => (
 								<div key={row.id} className="space-y-2 rounded-md border p-3" data-testid={`team-budget-row-${idx}`}>
 									<div className="flex items-start gap-2">
 										<div className="flex-1">
 											<NumberAndSelect
 												id={`budgetMaxLimit-${idx}`}
-												label={`Budget #${idx + 1}: Maximum Spend (USD)`}
+												label={t("sheet.budgetNLabel", { n: idx + 1 })}
 												value={row.maxLimit}
 												selectValue={row.resetDuration}
 												onChangeNumber={(value) => updateBudgetRow(idx, { maxLimit: value })}
-												onChangeSelect={(value) => updateBudgetRow(idx, { resetDuration: value })}
-												options={resetDurationOptions}
+												onChangeSelect={(value) =>
+													updateBudgetRow(idx, {
+														resetDuration: value,
+														// Drop a stale definition when leaving a quarterly window.
+														resetConfig: value.endsWith("Q") ? row.resetConfig : undefined,
+													})
+												}
+												options={budgetResetDurationOptions}
 												dataTestId={`budget-max-limit-input-${idx}`}
 											/>
 										</div>
@@ -408,9 +508,16 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 											className="text-muted-foreground hover:text-destructive mt-6 text-xs font-medium"
 											data-testid={`team-remove-budget-btn-${idx}`}
 										>
-											Remove
+											{t("plugins.remove")}
 										</button>
 									</div>
+									{row.resetDuration.endsWith("Q") && (
+										<QuarterStartSelect
+											data-testid={`team-budget-quarter-config-${idx}`}
+											value={row.resetConfig?.quarter_start_month}
+											onChange={(month) => updateBudgetRow(idx, { resetConfig: { quarter_start_month: month } })}
+										/>
+									)}
 								</div>
 							))}
 						</div>
@@ -418,7 +525,7 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 						{/* Rate Limit Configuration - Token Limits */}
 						<NumberAndSelect
 							id="tokenMaxLimit"
-							label="Maximum Tokens"
+							label={t("sheet.maximumTokens")}
 							value={formData.tokenMaxLimit}
 							selectValue={formData.tokenResetDuration}
 							onChangeNumber={(value) => updateField("tokenMaxLimit", value)}
@@ -429,7 +536,7 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 						{/* Rate Limit Configuration - Request Limits */}
 						<NumberAndSelect
 							id="requestMaxLimit"
-							label="Maximum Requests"
+							label={t("sheet.maximumRequests")}
 							value={formData.requestMaxLimit}
 							selectValue={formData.requestResetDuration}
 							onChangeNumber={(value) => updateField("requestMaxLimit", value)}
@@ -437,29 +544,30 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 							options={resetDurationOptions}
 						/>
 
+						<CalendarAlignmentNotice
+							enabled={formData.calendarAligned}
+							durations={calendarWindowDurations([
+								{
+									budgets: formData.budgets.map((b) => ({ max_limit: b.maxLimit, reset_duration: b.resetDuration })),
+									rate_limit: {
+										token_max_limit: formData.tokenMaxLimit,
+										token_reset_duration: formData.tokenResetDuration,
+										request_max_limit: formData.requestMaxLimit,
+										request_reset_duration: formData.requestResetDuration,
+									},
+								},
+							])}
+						/>
 						{/* Calendar alignment — team-wide setting that applies to all team budgets and the team rate limit */}
 						{(() => {
-							const hasAlignableBudget = formData.budgets.some(
-								(b) => b.maxLimit !== undefined && b.maxLimit !== null && supportsCalendarAlignment(b.resetDuration),
-							);
-							const hasAlignableRateLimit =
-								(formData.tokenMaxLimit !== undefined &&
-									formData.tokenMaxLimit !== null &&
-									supportsCalendarAlignment(formData.tokenResetDuration)) ||
-								(formData.requestMaxLimit !== undefined &&
-									formData.requestMaxLimit !== null &&
-									supportsCalendarAlignment(formData.requestResetDuration));
-							if (!hasAlignableBudget && !hasAlignableRateLimit) return null;
+							if (!canCalendarAlign) return null;
 							return (
 								<div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2">
 									<div className="space-y-0.5">
 										<Label htmlFor="team-calendar-aligned-toggle" className="text-sm font-normal">
-											Align to calendar cycle
+											{t("sheet.alignToCalendar")}
 										</Label>
-										<p className="text-muted-foreground text-xs">
-											Reset budgets and rate limits at the start of each period (e.g. 1st of month) instead of rolling from creation date.
-											Applies to durations of a day or longer.
-										</p>
+										<p className="text-muted-foreground text-xs">{t("sheet.alignToCalendarHelp")}</p>
 									</div>
 									<Switch
 										id="team-calendar-aligned-toggle"
@@ -475,16 +583,17 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 						<AlertDialog open={showCalendarAlignWarning} onOpenChange={setShowCalendarAlignWarning}>
 							<AlertDialogContent>
 								<AlertDialogHeader>
-									<AlertDialogTitle>Reset budget and rate-limit usage?</AlertDialogTitle>
+									<AlertDialogTitle>{t("sheet.resetUsageTitle")}</AlertDialogTitle>
 									<AlertDialogDescription>
-										Enabling calendar alignment will reset budget usage to <span className="font-semibold">$0.00</span> and token/request
-										rate-limit counters to <span className="font-semibold">0</span> for this team, then snap each reset date to the start of
-										its current period (e.g. start of day, week, month, or year). The usage reset cannot be undone, but calendar alignment
-										can be turned off later. This will take effect when you save.
+										<Trans
+											t={t}
+											i18nKey="teams.sheet.calendarAlignHelp"
+											components={{ bold0: <span className="font-semibold" />, bold1: <span className="font-semibold" /> }}
+										/>
 									</AlertDialogDescription>
 								</AlertDialogHeader>
 								<AlertDialogFooter>
-									<AlertDialogCancel data-testid="team-calendar-align-cancel-btn">Cancel</AlertDialogCancel>
+									<AlertDialogCancel data-testid="team-calendar-align-cancel-btn">{tCommon("cancel")}</AlertDialogCancel>
 									<AlertDialogAction
 										data-testid="team-calendar-align-enable-btn"
 										onClick={() => {
@@ -492,20 +601,27 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 											setShowCalendarAlignWarning(false);
 										}}
 									>
-										Enable Calendar Alignment
+										{t("sheet.enableCalendarAlignment")}
 									</AlertDialogAction>
 								</AlertDialogFooter>
 							</AlertDialogContent>
 						</AlertDialog>
+						<BudgetUsageResetDialog
+							data-testid="team-budget-reset-dialog"
+							ownerLabel="team"
+							open={resetPrompt.isOpen}
+							onOpenChange={resetPrompt.setOpen}
+							onChoice={(resetUsage) => resetPrompt.resolve(() => saveTeam(resetUsage))}
+						/>
 
 						{/* Current Usage Section (only shown when editing with existing limits) */}
 						{isEditing && ((team?.budgets && team.budgets.length > 0) || team?.rate_limit) && (
 							<div className="bg-muted/50 space-y-4 rounded-lg border p-4">
-								<p className="text-sm font-medium">Current Usage</p>
+								<p className="text-sm font-medium">{t("sheet.currentUsage")}</p>
 								<div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
 									{team?.budgets?.map((b) => (
 										<div key={b.id} className="space-y-1">
-											<p className="text-muted-foreground text-xs">Budget ({b.reset_duration})</p>
+											<p className="text-muted-foreground text-xs">{t("sheet.budgetDuration", { duration: b.reset_duration })}</p>
 											<div className="flex items-center gap-2">
 												<span className="font-mono text-sm">
 													{formatCurrency(b.current_usage)} / {formatCurrency(b.max_limit)}
@@ -515,19 +631,21 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 												</Badge>
 											</div>
 											<p className="text-muted-foreground text-xs">
-												Last Reset:{" "}
+												{t("sheet.lastReset")}{" "}
 												{formatDistanceToNow(new Date(b.last_reset), {
 													addSuffix: true,
+													locale: dateFnsLocale(i18n.language),
 												})}
 											</p>
 										</div>
 									))}
 									{team?.rate_limit?.token_max_limit && (
 										<div className="space-y-1">
-											<p className="text-muted-foreground text-xs">Tokens</p>
+											<p className="text-muted-foreground text-xs">{t("sheet.tokens")}</p>
 											<div className="flex items-center gap-2">
 												<span className="font-mono text-sm">
-													{team.rate_limit.token_current_usage.toLocaleString()} / {team.rate_limit.token_max_limit.toLocaleString()}
+													{team.rate_limit.token_current_usage.toLocaleString(getLocale())} /{" "}
+													{team.rate_limit.token_max_limit.toLocaleString(getLocale())}
 												</span>
 												<Badge
 													variant={
@@ -544,16 +662,21 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 												</Badge>
 											</div>
 											<p className="text-muted-foreground text-xs">
-												Last Reset: {formatDistanceToNow(new Date(team.rate_limit.token_last_reset), { addSuffix: true })}
+												{t("sheet.lastReset")}{" "}
+												{formatDistanceToNow(new Date(team.rate_limit.token_last_reset), {
+													addSuffix: true,
+													locale: dateFnsLocale(i18n.language),
+												})}
 											</p>
 										</div>
 									)}
 									{team?.rate_limit?.request_max_limit && (
 										<div className="space-y-1">
-											<p className="text-muted-foreground text-xs">Requests</p>
+											<p className="text-muted-foreground text-xs">{t("sheet.requests")}</p>
 											<div className="flex items-center gap-2">
 												<span className="font-mono text-sm">
-													{team.rate_limit.request_current_usage.toLocaleString()} / {team.rate_limit.request_max_limit.toLocaleString()}
+													{team.rate_limit.request_current_usage.toLocaleString(getLocale())} /{" "}
+													{team.rate_limit.request_max_limit.toLocaleString(getLocale())}
 												</span>
 												<Badge
 													variant={
@@ -571,7 +694,11 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 												</Badge>
 											</div>
 											<p className="text-muted-foreground text-xs">
-												Last Reset: {formatDistanceToNow(new Date(team.rate_limit.request_last_reset), { addSuffix: true })}
+												{t("sheet.lastReset")}{" "}
+												{formatDistanceToNow(new Date(team.rate_limit.request_last_reset), {
+													addSuffix: true,
+													locale: dateFnsLocale(i18n.language),
+												})}
 											</p>
 										</div>
 									)}
@@ -580,17 +707,17 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 						)}
 					</div>
 
-					<div className="border-border bg-card sticky bottom-0 z-10 border-t px-8 py-4">
+					<div className="border-border bg-card sticky bottom-0 z-10 border-t px-4 py-4 md:px-8">
 						<div className="flex justify-end gap-2">
 							<Button type="button" variant="outline" onClick={onCancel} disabled={loading}>
-								Cancel
+								{tCommon("cancel")}
 							</Button>
 							<TooltipProvider>
 								<Tooltip>
 									<TooltipTrigger asChild>
 										<span className="inline-block">
 											<Button type="submit" disabled={loading || !validator.isValid() || !hasPermission} data-testid="team-save-btn">
-												{loading ? "Saving..." : isEditing ? "Update Team" : "Create Team"}
+												{loading ? t("sheet.saving") : isEditing ? t("teams.sheet.updateAction") : t("teams.sheet.createAction")}
 											</Button>
 										</span>
 									</TooltipTrigger>
@@ -598,10 +725,10 @@ export default function TeamSheet({ team, customers, onSave, onCancel }: TeamShe
 										<TooltipContent>
 											<p>
 												{!hasPermission
-													? "You don't have permission to perform this action"
+													? t("sheet.noPermission")
 													: loading
-														? "Saving..."
-														: validator.getFirstError() || "Please fix validation errors"}
+														? t("sheet.saving")
+														: validator.getFirstError() || t("sheet.fixValidation")}
 											</p>
 										</TooltipContent>
 									)}

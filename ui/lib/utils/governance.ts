@@ -1,27 +1,31 @@
+import { supportsCalendarAlignment } from "@/lib/constants/governance";
+import i18n from "@/lib/i18n";
+import type { ParseKeys } from "i18next";
+
+const RESET_UNIT_KEYS: Record<string, ParseKeys<"common">> = {
+	s: "duration.second",
+	m: "duration.minute",
+	h: "duration.hour",
+	d: "duration.day",
+	w: "duration.week",
+	M: "duration.month",
+	Q: "duration.quarter",
+	y: "duration.year",
+};
+
 /**
  * Parses a duration string (e.g., "1m", "5m", "1h", "1d", "1w", "1M") into human readable format
  */
 export function parseResetPeriod(duration: string): string {
-	if (!duration) return "Unknown";
+	if (!duration) return i18n.t("duration.unknown");
 
 	const timeValue = parseInt(duration.slice(0, -1));
 	const timeUnit = duration.slice(-1);
 
-	const unitMap: Record<string, { singular: string; plural: string }> = {
-		s: { singular: "second", plural: "seconds" },
-		m: { singular: "minute", plural: "minutes" },
-		h: { singular: "hour", plural: "hours" },
-		d: { singular: "day", plural: "days" },
-		w: { singular: "week", plural: "weeks" },
-		M: { singular: "month", plural: "months" },
-		y: { singular: "year", plural: "years" },
-	};
+	const unitKey = RESET_UNIT_KEYS[timeUnit];
+	if (!unitKey) return duration;
 
-	const unit = unitMap[timeUnit];
-	if (!unit) return duration;
-
-	const unitName = timeValue === 1 ? unit.singular : unit.plural;
-	return `${timeValue} ${unitName}`;
+	return i18n.t(unitKey, { count: timeValue });
 }
 
 import { budgetOverrideFormSchema } from "@/lib/types/schemas";
@@ -53,7 +57,7 @@ export function getEffectiveBudgetLimit(budget: BudgetOverrideFields): number {
 /** Validates the operator-entered override fields before sending them to the API. Delegates to budgetOverrideFormSchema. */
 export function validateBudgetOverride(amount: number, mode: "cycles" | "forever", cycles: number): string | null {
 	const result = budgetOverrideFormSchema.safeParse({ amount, mode, ...(mode === "cycles" ? { cycles } : {}) });
-	return result.success ? null : (result.error.issues[0]?.message ?? "Invalid input");
+	return result.success ? null : (result.error.issues[0]?.message ?? i18n.t("validation.invalidInput"));
 }
 
 /**
@@ -68,6 +72,30 @@ function addUTCMonthsClamped(date: Date, months: number): void {
 	date.setUTCDate(Math.min(day, lastDay));
 }
 
+/** Snaps a calendar-aligned reset timestamp to its UTC period boundary. */
+function snapToCalendarPeriodStart(date: Date, unit: string): void {
+	switch (unit) {
+		case "d":
+			date.setUTCHours(0, 0, 0, 0);
+			break;
+		case "w": {
+			date.setUTCHours(0, 0, 0, 0);
+			const daysFromMonday = (date.getUTCDay() + 6) % 7;
+			date.setUTCDate(date.getUTCDate() - daysFromMonday);
+			break;
+		}
+		case "M":
+			date.setUTCDate(1);
+			date.setUTCHours(0, 0, 0, 0);
+			break;
+		case "y":
+		case "Y":
+			date.setUTCMonth(0, 1);
+			date.setUTCHours(0, 0, 0, 0);
+			break;
+	}
+}
+
 /** Calculates when a cycle-based override will expire on the budget's current reset schedule. */
 export function getBudgetOverrideValidUntil(
 	budget: Pick<BudgetOverrideFields, "max_limit"> & { last_reset: string; reset_duration: string },
@@ -75,12 +103,15 @@ export function getBudgetOverrideValidUntil(
 	calendarAligned = false,
 ): Date | null {
 	if (!Number.isSafeInteger(cycles) || cycles <= 0) return null;
-	const match = /^(\d+)([smhdwMyY])$/.exec(budget.reset_duration);
+	const match = /^(\d+)([smhdwMQyY])$/.exec(budget.reset_duration);
 	const validUntil = new Date(budget.last_reset);
 	if (!match || Number.isNaN(validUntil.getTime())) return null;
 
+	const unit = match[2];
+	calendarAligned = calendarAligned && supportsCalendarAlignment(budget.reset_duration);
+	if (calendarAligned) snapToCalendarPeriodStart(validUntil, unit);
 	const durationValue = Number(match[1]) * cycles;
-	switch (match[2]) {
+	switch (unit) {
 		case "s":
 			validUntil.setTime(validUntil.getTime() + durationValue * 1000);
 			break;
@@ -101,6 +132,15 @@ export function getBudgetOverrideValidUntil(
 				addUTCMonthsClamped(validUntil, durationValue);
 			} else {
 				validUntil.setTime(validUntil.getTime() + durationValue * 30 * 24 * 60 * 60 * 1000);
+			}
+			break;
+		case "Q":
+			// A calendar quarter is exactly three months; a rolling one is the 90-day
+			// approximation ParseDuration uses on the Go side.
+			if (calendarAligned) {
+				addUTCMonthsClamped(validUntil, durationValue * 3);
+			} else {
+				validUntil.setTime(validUntil.getTime() + durationValue * 90 * 24 * 60 * 60 * 1000);
 			}
 			break;
 		case "y":
@@ -172,4 +212,60 @@ export function getUsageVariant(percentage: number): "default" | "secondary" | "
 	if (percentage >= 90) return "destructive";
 	if (percentage >= 75) return "secondary";
 	return "default";
+}
+/** A budget reduced to the fields that decide whether its reset window moved. */
+export interface BudgetComparisonEntry {
+	id?: string;
+	max_limit?: number;
+	reset_duration?: string;
+	reset_config?: { quarter_start_month?: number };
+	current_usage?: number;
+}
+
+/** Normalised fiscal quarter start; absent and an explicit January are the same window. */
+export const quarterStartOf = (entry: Pick<BudgetComparisonEntry, "reset_config">) => entry.reset_config?.quarter_start_month || 1;
+
+/**
+ * A stable string describing every budget setting that moves a reset boundary.
+ *
+ * The fiscal quarter start belongs here for quarterly budgets: April and July
+ * are the same limit on the same 1Q cadence and differ only in when the window
+ * turns over, so a signature built from limit and duration alone reports "no
+ * change" for precisely the edit that reschedules the reset.
+ */
+export const budgetSignature = (budgets?: BudgetComparisonEntry[]) =>
+	(budgets || [])
+		.filter((budget) => budget.max_limit !== undefined)
+		.map((budget) => {
+			const quarterStart = budget.reset_duration?.endsWith("Q") ? quarterStartOf(budget) : "";
+			return `${budget.id ?? ""}:${budget.max_limit}:${budget.reset_duration ?? ""}:${quarterStart}`;
+		})
+		.sort()
+		.join("|");
+
+// Callers name the entity in English; the sentence shows its localized noun when one is known.
+const GOVERNANCE_ENTITY_KEYS: Record<string, ParseKeys<"common">> = {
+	"virtual keys": "entities.virtualKeys",
+	teams: "entities.teams",
+	customers: "entities.customers",
+	"model limits": "entities.modelLimits",
+};
+
+export type GovernanceAction = "create" | "edit" | "delete" | "rotate";
+
+/**
+ * Why a governance action is disabled, or undefined when it is allowed. A reason
+ * that is not about permissions (e.g. the entity is managed elsewhere) wins, since
+ * granting the permission would not unblock the action.
+ */
+export function actionDisabledReason(
+	allowed: boolean,
+	action: GovernanceAction,
+	entityPlural: string,
+	blockedReason?: string,
+): string | undefined {
+	if (blockedReason) return blockedReason;
+	if (allowed) return undefined;
+	const entityKey = GOVERNANCE_ENTITY_KEYS[entityPlural];
+	return i18n.t(`permissionDenied.${action}`, { entity: entityKey ? i18n.t(entityKey) : entityPlural });
 }

@@ -5,7 +5,9 @@ import (
 	"fmt"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/postgresconn"
+	"github.com/maximhq/bifrost/framework/storehooks"
 	"gorm.io/gorm"
 )
 
@@ -18,11 +20,11 @@ type PostgresConfig = postgresconn.Config
 // immediately, then a fresh runtime pool is opened. The runtime pool's
 // connections never see pre-migration schema, so their cached prepared-plans
 // stay valid for the life of the process.
-func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger schemas.Logger) (ConfigStore, error) {
+func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger schemas.Logger, migrationPause *logstore.MatViewPauseOptions) (ConfigStore, error) {
 	if err := postgresconn.Validate(config, false); err != nil {
 		return nil, err
 	}
-	dsn := postgresconn.BuildDSN(config)
+	dsn := postgresconn.WithApplicationName(postgresconn.BuildDSN(config), string(storehooks.RoleConfig))
 	logger.Debug("configstore: postgres target host=%s port=%s db=%s sslmode=%s",
 		config.Host.GetValue(), config.Port.GetValue(), config.DBName.GetValue(), config.SSLMode.GetValue())
 
@@ -31,7 +33,7 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// 0A000 ("cached plan must not change result type") structurally impossible
 	// when a migration mixes DDL with subsequent SELECTs against the same table.
 	// Runtime pools keep the default cache-statement mode for performance.
-	migrationDSN := dsn + " default_query_exec_mode=simple_protocol"
+	migrationDSN := postgresconn.MigrationDSN(dsn)
 
 	// Throwaway pool for schema migrations. Closing it before the runtime pool
 	// opens guarantees no cached prepared-plan survives the DDL.
@@ -41,8 +43,20 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 		logger.Error("configstore: failed to open migration connection pool: %v", err)
 		return nil, err
 	}
+	// Pin the throwaway pool small: migrations are serial DDL, and an untuned pool
+	// inherits database/sql's unlimited MaxOpenConns.
+	if err := postgresconn.ApplyMigrationPoolTuning(mDb); err != nil {
+		logger.Error("configstore: failed to tune migration connection pool: %v", err)
+		postgresconn.Close(mDb, logger)
+		return nil, err
+	}
 	logger.Info("configstore: migration pool opened; running schema migrations (may block on a cross-node advisory lock if another pod is migrating)")
-	if err := triggerMigrations(ctx, mDb, logger); err != nil {
+	pause := migrationMatViewPause
+	if migrationPause != nil {
+		pause = *migrationPause
+	}
+	retry := postgresconn.MigrationLockRetryOptions(config, logger)
+	if err := triggerMigrationsWithOptions(ctx, mDb, logger, pause, retry); err != nil {
 		logger.Error("configstore: schema migrations failed: %v", err)
 		postgresconn.Close(mDb, logger)
 		return nil, err
@@ -57,7 +71,7 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 		logger.Error("configstore: failed to open runtime connection pool: %v", err)
 		return nil, err
 	}
-	if err := postgresconn.ApplyPoolTuning(db, config); err != nil {
+	if err := postgresconn.ApplyPoolTuning(db, config, logger); err != nil {
 		logger.Error("configstore: failed to apply connection pool tuning: %v", err)
 		postgresconn.Close(db, logger)
 		return nil, err
@@ -66,6 +80,7 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 	// plaintext SecretVar fields are rewritten to vault refs before persistence
 	// and owned vault secrets are cleaned up on delete.
 	RegisterVaultCallbacks(db)
+	storehooks.PoolOpened(storehooks.RoleConfig, db)
 	logger.Info("configstore: runtime connection pool ready")
 
 	d := &RDBConfigStore{logger: logger}
@@ -79,6 +94,11 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 			return err
 		}
 		defer postgresconn.Close(tempDB, logger)
+		// fn is supplied by downstream consumers, so bound the pool rather than
+		// leaving it on database/sql's unlimited default.
+		if err := postgresconn.ApplyMigrationPoolTuning(tempDB); err != nil {
+			return err
+		}
 		return fn(ctx, tempDB)
 	}
 
@@ -91,11 +111,12 @@ func newPostgresConfigStore(ctx context.Context, config *PostgresConfig, logger 
 		if err != nil {
 			return fmt.Errorf("failed to open fresh runtime pool: %w", err)
 		}
-		if err := postgresconn.ApplyPoolTuning(newDB, config); err != nil {
+		if err := postgresconn.ApplyPoolTuning(newDB, config, logger); err != nil {
 			postgresconn.Close(newDB, logger)
 			return fmt.Errorf("failed to tune fresh runtime pool: %w", err)
 		}
 		RegisterVaultCallbacks(newDB)
+		storehooks.PoolOpened(storehooks.RoleConfig, newDB)
 		oldDB := d.db.Swap(newDB)
 		if oldDB != nil {
 			postgresconn.Close(oldDB, logger)
