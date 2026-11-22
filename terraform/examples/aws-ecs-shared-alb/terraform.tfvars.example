@@ -17,7 +17,9 @@ shared_alb_name        = "datadestination-shared-alb"
 bifrost_hostname       = "bifrost.internjobs.io"
 listener_rule_priority = 500
 
-image_tag = "latest"
+# Pinned on purpose. Do not use "latest": Fargate resolves it at task start,
+# so a task restart can silently upgrade the service.
+image_tag = "v2.6.0"
 
 # -----------------------------------------------------------------------------
 # Auth — set an admin password. Required for the Bifrost admin UI/API.

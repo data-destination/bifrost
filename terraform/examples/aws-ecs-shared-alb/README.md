@@ -159,6 +159,8 @@ terraform plan -out=tfplan
 terraform apply tfplan
 ```
 
+The image tag is pinned (`image_tag`, default `v2.6.0`). `latest` is intentionally not used: Fargate resolves it at task start, so a task restart can silently upgrade the service. To upgrade, change `image_tag` to a released `maximhq/bifrost` tag and apply.
+
 ## Cleanup
 
 ```bash

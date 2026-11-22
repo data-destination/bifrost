@@ -166,7 +166,7 @@ variable "ingress_path" {
 variable "image_tag" {
   description = "Bifrost Docker image tag."
   type        = string
-  default     = "latest"
+  default     = "v2.6.0"
 }
 
 variable "image_repository" {
